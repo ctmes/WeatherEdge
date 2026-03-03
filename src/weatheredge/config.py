@@ -49,6 +49,49 @@ WEATHER_KEYWORDS: list[str] = [
     "heat",
     "cold",
     "climate",
+    "forecast",
+    "wind",
+    "storm",
+    "hurricane",
+    "tornado",
+    "blizzard",
+    "hail",
+    "frost",
+    "drought",
+    "flood",
+    "celsius",
+    "fahrenheit",
+]
+
+# Blocklist — if ANY of these appear in the market text, reject it even if
+# a weather keyword matched.  Prevents false-positives like "political
+# climate", "heated debate", "cold war", "crypto winter", etc.
+NON_WEATHER_BLOCKLIST: list[str] = [
+    # Politics / government
+    "election", "president", "congress", "senate", "political",
+    "trump", "biden", "democrat", "republican", "gop",
+    "vote", "ballot", "poll ", "impeach", "governor", "mayor",
+    "legislation", "partisan", "geopolitic",
+    # Crypto / finance
+    "crypto", "bitcoin", "ethereum", "token price", "nft",
+    "stock", "nasdaq", "s&p", "dow jones", "fed rate",
+    "interest rate", "gdp", "inflation rate", "unemployment",
+    "earnings", "ipo", "market cap",
+    # Military / conflict
+    "war", "conflict", "military", "invasion", "nuclear",
+    "cold war", "sanctions",
+    # Sports
+    "super bowl", "nfl", "nba", "nhl", "mlb", "fifa",
+    "world cup", "championship", "playoff", "touchdown",
+    # Entertainment / culture
+    "oscar", "grammy", "emmy", "box office", "album",
+    # Tech / AI
+    "artificial intelligence", "chatgpt", "openai",
+    # Health
+    "covid", "pandemic", "vaccine", "virus",
+    # Misc non-weather
+    "approval rating", "indictment", "verdict", "lawsuit",
+    "streamer", "twitch", "youtube",
 ]
 
 

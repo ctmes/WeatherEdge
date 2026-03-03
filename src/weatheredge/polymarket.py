@@ -17,6 +17,7 @@ log = logging.getLogger("weatheredge.polymarket")
 from weatheredge.config import (
     POLYMARKET_CLOB_BASE,
     POLYMARKET_GAMMA_BASE,
+    NON_WEATHER_BLOCKLIST,
     WEATHER_KEYWORDS,
 )
 from weatheredge.models import ParsedMarket
@@ -48,13 +49,25 @@ async def fetch_weather_markets(
     page_size: int = 100,
 ) -> list[ParsedMarket]:
     """
-    Paginate through the Gamma Markets API, filter for weather markets,
-    and return parsed market objects.
+    Fetch active weather markets from both the Gamma ``/markets`` and
+    ``/events`` endpoints, merge and de-duplicate.
 
-    The Gamma API (gamma-api.polymarket.com) provides richer market metadata
-    than the raw CLOB and is easier to paginate / filter.
+    The ``/events`` endpoint returns parent events with child markets
+    (one per temperature bin), which is the format Polymarket uses for
+    daily weather markets.  The ``/markets`` endpoint returns individual
+    child markets that may lack the parent context needed for station
+    matching.
+
+    Event-based results take priority during de-duplication since they
+    carry richer metadata (city, bins, station mapping).
     """
-    markets: list[ParsedMarket] = []
+    # --- Fetch from /events first (higher quality data) ---
+    event_markets = await fetch_weather_events(max_pages=max_pages, page_size=page_size)
+    seen_ids: set[str] = {m.condition_id for m in event_markets}
+    log.info("Fetched %d markets from /events endpoint", len(event_markets))
+
+    # --- Fetch from /markets as fallback ---
+    market_markets: list[ParsedMarket] = []
     offset = 0
 
     for _ in range(max_pages):
@@ -73,23 +86,86 @@ async def fetch_weather_markets(
         for item in data:
             if _is_weather_market(item):
                 parsed = _raw_to_parsed_market(item)
-                if parsed is not None:
-                    markets.append(parsed)
+                if parsed is not None and parsed.condition_id not in seen_ids:
+                    market_markets.append(parsed)
+                    seen_ids.add(parsed.condition_id)
 
         if len(data) < page_size:
             break
         offset += page_size
 
+    log.info("Fetched %d additional markets from /markets endpoint", len(market_markets))
+    return event_markets + market_markets
+
+
+async def fetch_weather_events(
+    *,
+    max_pages: int = 20,
+    page_size: int = 100,
+) -> list[ParsedMarket]:
+    """
+    Fetch active daily weather events from Gamma ``GET /events``.
+
+    Daily weather markets on Polymarket are structured as events with
+    child markets (one per temperature bin).  This function fetches the
+    parent events, filters for daily weather markets, and parses them
+    using :func:`parse_daily_weather_event`.
+    """
+    markets: list[ParsedMarket] = []
+    offset = 0
+
+    for _ in range(max_pages):
+        url = f"{POLYMARKET_GAMMA_BASE}/events"
+        params = {
+            "limit": page_size,
+            "offset": offset,
+            "active": "true",
+            "closed": "false",
+        }
+
+        try:
+            data = await _get_json(url, params)
+        except Exception as e:
+            log.warning("Gamma /events fetch failed (offset=%d): %s", offset, e)
+            break
+
+        if not data:
+            break
+
+        for event in data:
+            title = event.get("title", "").lower()
+            # Filter for daily weather events
+            if "highest temperature in" not in title and "temperature" not in title:
+                continue
+
+            parsed = parse_daily_weather_event(event)
+            if parsed is not None:
+                markets.append(parsed)
+
+        if len(data) < page_size:
+            break
+        offset += page_size
+
+    log.info("Parsed %d daily weather events from /events", len(markets))
     return markets
 
 
 def _is_weather_market(item: dict) -> bool:
-    """Return True if the market looks like a weather market."""
+    """Return True if the market looks like a weather market.
+
+    Rejects markets that match non-weather blocklist terms (politics,
+    crypto, sports, etc.) even if a weather keyword happens to appear.
+    """
     searchable = " ".join([
         item.get("question", ""),
         item.get("description", ""),
         " ".join(item.get("tags", []) if isinstance(item.get("tags"), list) else []),
     ]).lower()
+
+    # Reject non-weather markets first
+    if any(bl in searchable for bl in NON_WEATHER_BLOCKLIST):
+        return False
+
     return any(kw in searchable for kw in WEATHER_KEYWORDS + CLIMATE_KEYWORDS)
 
 
@@ -153,6 +229,16 @@ def _raw_to_parsed_market(item: dict) -> ParsedMarket | None:
         market.bins = parsed.get("bins", [])
         market.timezone = parsed.get("timezone")
         market.resolution_date = parsed.get("resolution_date")
+
+        # --- City-name fallback for station matching ---
+        if market.station_id is None:
+            from weatheredge.stations import CITY_TO_STATION
+            city = _extract_city_from_title(question)
+            if city:
+                for k, v in CITY_TO_STATION.items():
+                    if k.lower() == city.lower():
+                        market.station_id = v
+                        break
 
         return market
     except Exception:

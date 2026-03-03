@@ -93,3 +93,111 @@ class TestParseBinsFromOutcomes:
         outcomes = ["Yes", "No"]
         bins = parse_bins_from_outcomes(outcomes)
         assert bins == []
+
+
+# =========================================================================
+# _raw_to_parsed_market — city-name fallback
+# =========================================================================
+
+class TestCityNameFallback:
+    """When ICAO/WU parsing fails, fall back to city name from question."""
+
+    def test_city_name_sets_station_id(self):
+        from weatheredge.polymarket import _raw_to_parsed_market
+        item = {
+            "conditionId": "test-nyc-123",
+            "question": "Highest temperature in NYC on March 5?",
+            "description": "This market resolves to the high temperature.",
+            "outcomes": '["42-43°F", "44-45°F"]',
+            "outcomePrices": '[0.3, 0.7]',
+        }
+        market = _raw_to_parsed_market(item)
+        assert market is not None
+        assert market.station_id == "KLGA"
+
+    def test_unknown_city_leaves_station_none(self):
+        from weatheredge.polymarket import _raw_to_parsed_market
+        item = {
+            "conditionId": "test-timbuktu-456",
+            "question": "Highest temperature in Timbuktu on March 5?",
+            "description": "Resolves to the daily high.",
+            "outcomes": '["Yes", "No"]',
+            "outcomePrices": '[0.5, 0.5]',
+        }
+        market = _raw_to_parsed_market(item)
+        assert market is not None
+        assert market.station_id is None
+
+    def test_non_weather_title_no_crash(self):
+        from weatheredge.polymarket import _raw_to_parsed_market
+        item = {
+            "conditionId": "test-other-789",
+            "question": "Will it rain tomorrow?",
+            "description": "General weather question.",
+            "outcomes": '["Yes", "No"]',
+            "outcomePrices": '[0.5, 0.5]',
+        }
+        market = _raw_to_parsed_market(item)
+        assert market is not None
+
+
+# =========================================================================
+# fetch_weather_events (mocked)
+# =========================================================================
+
+class TestFetchWeatherEvents:
+    """Test the /events endpoint fetcher with mocked HTTP."""
+
+    @pytest.mark.asyncio
+    async def test_parses_daily_event(self, monkeypatch):
+        """A well-formed event with child markets should produce a ParsedMarket."""
+        from weatheredge import polymarket as pm
+
+        fake_event = {
+            "id": "evt-nyc-1",
+            "title": "Highest temperature in NYC on March 5?",
+            "endDate": "2026-03-05T23:59:59Z",
+            "volume": 10000,
+            "markets": [
+                {
+                    "groupItemTitle": "42-43°F",
+                    "groupItemThreshold": "42",
+                    "description": "Resolves to the daily high temp in NYC.",
+                    "outcomePrices": '[0.2, 0.8]',
+                    "outcomes": '["Yes", "No"]',
+                },
+                {
+                    "groupItemTitle": "44°F or higher",
+                    "groupItemThreshold": "44",
+                    "description": "Resolves to the daily high temp in NYC.",
+                    "outcomePrices": '[0.7, 0.3]',
+                    "outcomes": '["Yes", "No"]',
+                },
+            ],
+        }
+
+        async def fake_get_json(url, params=None):
+            if "/events" in url:
+                return [fake_event]
+            return []
+
+        monkeypatch.setattr(pm, "_get_json", fake_get_json)
+
+        results = await pm.fetch_weather_events()
+        assert len(results) >= 1
+        m = results[0]
+        assert m.station_id == "KLGA"
+        assert m.question == "Highest temperature in NYC on March 5?"
+
+    @pytest.mark.asyncio
+    async def test_skips_non_weather_events(self, monkeypatch):
+        """Events without temperature keywords should be skipped."""
+        from weatheredge import polymarket as pm
+
+        async def fake_get_json(url, params=None):
+            return [{"id": "evt-politics", "title": "Will candidate X win?", "markets": []}]
+
+        monkeypatch.setattr(pm, "_get_json", fake_get_json)
+
+        results = await pm.fetch_weather_events()
+        assert len(results) == 0
