@@ -45,7 +45,7 @@ async def _get_json(url: str, params: dict | None = None) -> Any:
 
 async def fetch_weather_markets(
     *,
-    max_pages: int = 20,
+    max_pages: int = 50,
     page_size: int = 100,
 ) -> list[ParsedMarket]:
     """
@@ -100,7 +100,7 @@ async def fetch_weather_markets(
 
 async def fetch_weather_events(
     *,
-    max_pages: int = 20,
+    max_pages: int = 50,
     page_size: int = 100,
 ) -> list[ParsedMarket]:
     """
@@ -166,7 +166,18 @@ def _is_weather_market(item: dict) -> bool:
     if any(bl in searchable for bl in NON_WEATHER_BLOCKLIST):
         return False
 
-    return any(kw in searchable for kw in WEATHER_KEYWORDS + CLIMATE_KEYWORDS)
+    # Check for keywords
+    for kw in WEATHER_KEYWORDS + CLIMATE_KEYWORDS:
+        if kw in searchable:
+            # For short or common words, require word boundaries to avoid 
+            # false positives like "ukraine" matching "rain" or "wind" 
+            # in names.
+            if kw in ("rain", "temp", "wind", "ice", "cold", "heat"):
+                if not re.search(rf"\b{kw}\b", searchable):
+                    continue
+            return True
+            
+    return False
 
 
 def _raw_to_parsed_market(item: dict) -> ParsedMarket | None:
@@ -483,8 +494,9 @@ def _detect_unit(text: str) -> str:
 
 def _extract_city_from_title(title: str) -> str | None:
     """Extract city name from 'Highest temperature in NYC on March 3?'"""
-    match = re.match(
-        r"highest\s+temperature\s+in\s+(.+?)\s+on\s+",
+    # Try more robust pattern that handles variations in spacing and punctuation
+    match = re.search(
+        r"temperature\sin\s+([^?]+?)\s+(?:on|be|reach|stay)\b",
         title,
         re.IGNORECASE,
     )

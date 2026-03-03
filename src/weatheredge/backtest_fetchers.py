@@ -351,10 +351,22 @@ async def fetch_historical_forecast(
 
         try:
             async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.get(OPEN_METEO_HISTORICAL, params=params)
-                resp.raise_for_status()
-                cached = resp.json()
-                _write_cache(cache_k, cached)
+                max_retries = 5
+                for attempt in range(max_retries):
+                    resp = await client.get(OPEN_METEO_HISTORICAL, params=params)
+                    
+                    if resp.status_code == 429:
+                        wait_time = (2 ** attempt) + 1
+                        log.warning("Rate limited (429). Retrying in %ds... (attempt %d/%d)", 
+                                    wait_time, attempt + 1, max_retries)
+                        import asyncio
+                        await asyncio.sleep(wait_time)
+                        continue
+                        
+                    resp.raise_for_status()
+                    cached = resp.json()
+                    _write_cache(cache_k, cached)
+                    break
         except Exception as e:
             log.warning(
                 "Historical forecast fetch failed (%s %s %s): %s",

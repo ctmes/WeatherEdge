@@ -8,12 +8,13 @@ This is the moat. (godpaper Section 6)
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, timedelta
-from typing import Any
-
+import asyncio
+import logging
 import numpy as np
 
 from weatheredge.mesonet import DailyObservation
+
+logger = logging.getLogger("weatheredge.calibration")
 
 
 # =========================================================================
@@ -41,6 +42,18 @@ class StationBias:
     tmin_bias_winter: float = 0.0
     tmin_bias_spring: float = 0.0
     tmin_bias_autumn: float = 0.0
+
+    # Statistical significance (p-values) per season
+    # Higher p-value = bias is likely noise. p < 0.05 is standard significance.
+    tmax_p_values: dict[str, float] = field(default_factory=dict)
+    tmin_p_values: dict[str, float] = field(default_factory=dict)
+    
+    # Standard Errors per season
+    tmax_std_errors: dict[str, float] = field(default_factory=dict)
+    tmin_std_errors: dict[str, float] = field(default_factory=dict)
+
+    # Sample sizes per season
+    seasonal_counts: dict[str, int] = field(default_factory=dict)
 
     # Overall statistics
     tmax_rmse: float = 0.0
@@ -109,6 +122,8 @@ def build_calibration(
 
     Returns a StationBias with seasonal bias corrections and error metrics.
     """
+    import scipy.stats as stats
+
     if not pairs:
         return StationBias(station_id="unknown")
 
@@ -147,6 +162,23 @@ def build_calibration(
     def _mae(vals: list[float]) -> float:
         return float(np.mean(np.abs(vals))) if vals else 0.0
 
+    def _stats(vals: list[float]) -> tuple[float, float]:
+        """Return (p_value, std_error) if enough data, else (1.0, 0.0)"""
+        if len(vals) < 2:
+            return 1.0, 0.0
+        t_stat, p_val = stats.ttest_1samp(vals, 0)
+        std_err = float(np.std(vals, ddof=1) / np.sqrt(len(vals)))
+        return float(p_val), std_err
+
+    p_tmax, se_tmax = {}, {}
+    p_tmin, se_tmin = {}, {}
+    counts = {}
+
+    for s in ["summer", "winter", "spring", "autumn"]:
+        p_tmax[s], se_tmax[s] = _stats(seasonal_tmax[s])
+        p_tmin[s], se_tmin[s] = _stats(seasonal_tmin[s])
+        counts[s] = len(seasonal_tmax[s])
+
     return StationBias(
         station_id=station_id,
         n_observations=len(pairs),
@@ -158,6 +190,11 @@ def build_calibration(
         tmin_bias_winter=_mean(seasonal_tmin["winter"]),
         tmin_bias_spring=_mean(seasonal_tmin["spring"]),
         tmin_bias_autumn=_mean(seasonal_tmin["autumn"]),
+        tmax_p_values=p_tmax,
+        tmin_p_values=p_tmin,
+        tmax_std_errors=se_tmax,
+        tmin_std_errors=se_tmin,
+        seasonal_counts=counts,
         tmax_rmse=_rmse(tmax_errors),
         tmin_rmse=_rmse(tmin_errors),
         tmax_mae=_mae(tmax_errors),
@@ -259,3 +296,135 @@ def pair_observations_with_forecasts(
             ))
 
     return pairs
+
+
+# =========================================================================
+# Standalone Runner
+# =========================================================================
+
+async def run_calibration(
+    station_id: str,
+    days: int = 365,
+) -> tuple[StationBias, dict[str, Any]]:
+    """
+    Standalone runner for station calibration (godpaper Section 6 / Quant Audit).
+    
+    1. Fetch historical observations (Mesonet)
+    2. Fetch historical forecasts (backtest_fetchers)
+    3. Split into Train (80%) and Test (20%) sets
+    4. Build calibration on Train set
+    5. Evaluate on Test set (MSE improvement)
+    
+    Returns (StationBias, metrics_dict).
+    """
+    from datetime import date, timedelta
+    from weatheredge.backtest_fetchers import fetch_historical_forecast_ensemble
+    from weatheredge.mesonet import fetch_daily_observations
+    from weatheredge.stations import get_station
+
+    station = get_station(station_id)
+    if not station:
+        raise ValueError(f"Unknown station: {station_id}")
+
+    end = date.today() - timedelta(days=1)
+    start = end - timedelta(days=days)
+
+    logger.info("Fetching %d days of data for %s...", days, station_id)
+    observations = await fetch_daily_observations(station_id, start, end)
+
+    if not observations:
+        return StationBias(station_id=station_id), {"error": "No observations found"}
+
+    logger.info("Retrieved %d daily observations.", len(observations))
+
+    # Concurrency control: Limit to 5 simultaneous API requests
+    sem = asyncio.Semaphore(5)
+
+    async def _fetch_with_sem(lat, lon, dt, tz):
+        async with sem:
+            return await fetch_historical_forecast_ensemble(lat, lon, dt, timezone=tz)
+
+    # Gather forecast fetches in parallel with semaphore pacing
+    forecast_tasks = [
+        _fetch_with_sem(
+            station.latitude, station.longitude, o.date, station.timezone
+        )
+        for o in observations
+    ]
+
+    logger.info("Fetching %d historical forecasts (pacing with semaphore)...", len(forecast_tasks))
+    forecasts_results = await asyncio.gather(*forecast_tasks)
+
+    pairs = []
+    for obs, fc in zip(observations, forecasts_results):
+        if fc and obs.tmax_c is not None:
+            pairs.append(CalibrationPair(
+                station_id=station_id,
+                valid_date=obs.date,
+                forecast_tmax=fc.tmax_mean,
+                observed_tmax=obs.tmax_c,
+                forecast_tmin=fc.tmin_mean,
+                observed_tmin=obs.tmin_c,
+                lead_time_days=1,
+            ))
+
+    if not pairs:
+        return StationBias(station_id=station_id), {"error": "No paired data found"}
+
+    # Split Train/Test (80/20) — sorted by date
+    pairs.sort(key=lambda x: x.valid_date)
+    split_idx = int(len(pairs) * 0.8)
+    train_pairs = pairs[:split_idx]
+    test_pairs = pairs[split_idx:]
+
+    bias = build_calibration(train_pairs)
+
+    # ── OOS Evaluation ──────────────────────────────────────────
+    # Quant Audit: Verify that bias reduces MSE on holdout set.
+    def _get_mse(p_list: list[CalibrationPair], b: StationBias | None = None) -> float:
+        errors = []
+        for p in p_list:
+            fc = p.forecast_tmax
+            if b:
+                fc = apply_calibration(fc, b, p.valid_date, metric="tmax")
+            errors.append((p.observed_tmax - fc) ** 2)
+        return float(np.mean(errors)) if errors else 0.0
+
+    raw_mse = _get_mse(test_pairs)
+    cal_mse = _get_mse(test_pairs, bias)
+    improvement = (raw_mse - cal_mse) / raw_mse if raw_mse > 0 else 0.0
+
+    metrics = {
+        "train_size": len(train_pairs),
+        "test_size": len(test_pairs),
+        "raw_oos_mse": raw_mse,
+        "cal_oos_mse": cal_mse,
+        "oos_improvement_pct": improvement * 100,
+        "is_valid": improvement > 0,
+    }
+
+    return bias, metrics
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: python -m weatheredge.calibration <station_id>")
+        sys.exit(1)
+        
+    logging.basicConfig(level=logging.INFO)
+    sid = sys.argv[1]
+    b, m = asyncio.run(run_calibration(sid))
+    
+    print("\n" + "="*40)
+    print(f" Calibration Report: {sid}")
+    print("="*40)
+    print(f"Train Size: {m['train_size']}")
+    print(f"Test Size:  {m['test_size']}")
+    print(f"OOS Imprvt: {m['oos_improvement_pct']:.1f}%")
+    print("-" * 40)
+    print(f"Summer Bias: {b.tmax_bias_summer:+.2f}C (p={b.tmax_p_values.get('summer', 1.0):.3f})")
+    print(f"Winter Bias: {b.tmax_bias_winter:+.2f}C (p={b.tmax_p_values.get('winter', 1.0):.3f})")
+    print(f"Spring Bias: {b.tmax_bias_spring:+.2f}C (p={b.tmax_p_values.get('spring', 1.0):.3f})")
+    print(f"Autumn Bias: {b.tmax_bias_autumn:+.2f}C (p={b.tmax_p_values.get('autumn', 1.0):.3f})")
+    print("="*40)

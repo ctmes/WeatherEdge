@@ -103,6 +103,71 @@ async def upsert_market(session: AsyncSession, market_data: dict) -> None:
     await session.execute(stmt)
 
 
+async def upsert_calibration(session: AsyncSession, bias: Any) -> None:
+    """
+    Upsert a StationCalibration row.
+    `bias` should be a StationBias object from calibration.py.
+    """
+    from datetime import datetime
+
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+    from weatheredge.models import StationCalibration
+
+    data = {
+        "station_id": bias.station_id,
+        "tmax_bias_summer": bias.tmax_bias_summer,
+        "tmax_bias_winter": bias.tmax_bias_winter,
+        "tmax_bias_spring": bias.tmax_bias_spring,
+        "tmax_bias_autumn": bias.tmax_bias_autumn,
+        "tmin_bias_summer": bias.tmin_bias_summer,
+        "tmin_bias_winter": bias.tmin_bias_winter,
+        "tmin_bias_spring": bias.tmin_bias_spring,
+        "tmin_bias_autumn": bias.tmin_bias_autumn,
+        "lead_time_degradation": bias.lead_time_degradation,
+        "last_updated": datetime.utcnow(),
+    }
+
+    stmt = sqlite_insert(StationCalibration).values(**data)
+    update_cols = {k: v for k, v in data.items() if k != "station_id"}
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[StationCalibration.station_id],
+        set_=update_cols,
+    )
+    await session.execute(stmt)
+
+
+async def get_calibrations(session: AsyncSession) -> dict[str, Any]:
+    """Fetch all stored calibrations as a dict mapping station_id -> StationBias."""
+    from sqlalchemy import select
+
+    from weatheredge.calibration import StationBias
+    from weatheredge.models import StationCalibration
+
+    result = await session.execute(select(StationCalibration))
+    rows = result.scalars().all()
+
+    calibrations = {}
+    for r in rows:
+        bias = StationBias(
+            station_id=r.station_id,
+            tmax_bias_summer=r.tmax_bias_summer or 0.0,
+            tmax_bias_winter=r.tmax_bias_winter or 0.0,
+            tmax_bias_spring=r.tmax_bias_spring or 0.0,
+            tmax_bias_autumn=r.tmax_bias_autumn or 0.0,
+            tmin_bias_summer=r.tmin_bias_summer or 0.0,
+            tmin_bias_winter=r.tmin_bias_winter or 0.0,
+            tmin_bias_spring=r.tmin_bias_spring or 0.0,
+            tmin_bias_autumn=r.tmin_bias_autumn or 0.0,
+            lead_time_degradation=r.lead_time_degradation or 0.15,
+        )
+        # We don't store n_observations or error metrics in the DB yet,
+        # but the StationBias dataclass supports them.
+        calibrations[r.station_id] = bias
+
+    return calibrations
+
+
 # ---------------------------------------------------------------------------
 # Teardown (for tests / clean shutdown)
 # ---------------------------------------------------------------------------

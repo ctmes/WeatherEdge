@@ -104,9 +104,13 @@ class StationCalibration(Base):
     elevation = Column(Float)
     tmax_bias_summer = Column(Float, default=0)
     tmax_bias_winter = Column(Float, default=0)
+    tmax_bias_spring = Column(Float, default=0)
+    tmax_bias_autumn = Column(Float, default=0)
     tmin_bias_summer = Column(Float, default=0)
     tmin_bias_winter = Column(Float, default=0)
-    lead_time_degradation = Column(Float, default=0)
+    tmin_bias_spring = Column(Float, default=0)
+    tmin_bias_autumn = Column(Float, default=0)
+    lead_time_degradation = Column(Float, default=0.15)
     last_updated = Column(DateTime)
 
 

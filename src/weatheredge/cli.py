@@ -121,25 +121,15 @@ def main() -> None:
     )
 
     cal_parser.add_argument(
-
         "station", type=str,
-
         help="ICAO station ID to calibrate (e.g. NZWN, KORD)",
-
     )
-
     cal_parser.add_argument(
-
-        "--days", type=int, default=90,
-
-        help="Number of historical days to fetch (default: 90)",
-
+        "--days", type=int, default=365,
+        help="Number of historical days to fetch (default: 365)",
     )
-
     cal_parser.add_argument(
-
         "-v", "--verbose", action="store_true", help="Enable debug logging",
-
     )
 
 
@@ -529,102 +519,70 @@ def _run_diagnose(args: argparse.Namespace) -> None:
 
 
 def _run_calibrate(args: argparse.Namespace) -> None:
+    from weatheredge.calibration import run_calibration
+    from weatheredge.db import get_session, init_db, upsert_calibration
 
-    from datetime import date, timedelta
+    async def _do():
+        await init_db()
+        bias, metrics = await run_calibration(args.station, days=args.days)
 
+        if "error" in metrics:
+            print(f"\n  ✗ Calibration failed: {metrics['error']}\n")
+            return
 
+        print()
+        print("=" * 60)
+        print(f"  Station Calibration Report: {args.station}")
+        print("=" * 60)
+        print(f"  Configuration:")
+        print(f"    Lookback:       {args.days} days")
+        print(f"    Train Sample:   {metrics['train_size']} paired days")
+        print(f"    Test Sample:    {metrics['test_size']} paired days")
+        print()
+        
+        print(f"  OOS Validation (Holdout Set):")
+        print(f"    Raw MSE:        {metrics['raw_oos_mse']:.4f}")
+        print(f"    Calibrated MSE: {metrics['cal_oos_mse']:.4f}")
+        
+        imprvt = metrics['oos_improvement_pct']
+        color = "\033[92m" if imprvt > 0 else "\033[91m"
+        print(f"    Improvement:   {color}{imprvt:+.1f}%\033[0m")
+        print()
 
-    from weatheredge.calibration import (
+        print("  Seasonal Tmax Biases (Obs - Forecast):")
+        print("    Season      Bias      p-val     N      Status")
+        print("    " + "-" * 50)
+        
+        for s in ["summer", "winter", "spring", "autumn"]:
+            b_val = getattr(bias, f"tmax_bias_{s}")
+            p_val = bias.tmax_p_values.get(s, 1.0)
+            count = bias.seasonal_counts.get(s, 0)
+            
+            # Status indicators
+            sig = "✓ significant" if p_val < 0.05 else "✗ noisy"
+            if count < 50:
+                sig += " (small sample)"
+                
+            print(f"    {s:<11} {b_val:>+6.2f}C    {p_val:>5.3f}    {count:>3}    {sig}")
 
-        StationBias,
+        print()
+        print(f"  Overall Tmax RMSE: {bias.tmax_rmse:.2f}C")
+        print("=" * 60)
+        print()
 
-        build_calibration,
+        # Prompt to save
+        if imprvt <= 0:
+            print("  ⚠️ WARNING: Calibration did not improve performance on holdout set.")
+        
+        confirm = input(f"  Save these calibrations for {args.station} to database? [y/N]: ").lower()
+        if confirm == 'y':
+            async with get_session() as session:
+                await upsert_calibration(session, bias)
+            print(f"\n  ✓ Calibrations saved for {args.station}.")
+        else:
+            print("\n  Discarded calibrations.")
 
-        pair_observations_with_forecasts,
-
-    )
-
-    from weatheredge.mesonet import fetch_daily_observations
-
-    from weatheredge.stations import get_station
-
-
-
-    station = get_station(args.station)
-
-    if station is None:
-
-        print(f"\n  ✗ Unknown station: {args.station}\n")
-
-        sys.exit(1)
-
-
-
-    end = date.today()
-
-    start = end - timedelta(days=args.days)
-
-
-
-    print(f"\n  Fetching {args.days} days of observations for {station.id} ({station.name})...")
-
-    observations = asyncio.run(fetch_daily_observations(station.id, start, end))
-
-    print(f"  Retrieved {len(observations)} daily observations.")
-
-
-
-    if not observations:
-
-        print("  ✗ No observations found. Check station ID.\n")
-
-        sys.exit(1)
-
-
-
-    # Show basic stats
-
-    tmax_vals = [o.tmax_c for o in observations if o.tmax_c is not None]
-
-    tmin_vals = [o.tmin_c for o in observations if o.tmin_c is not None]
-
-
-
-    print()
-
-    print(f"  Station: {station.id} - {station.name}")
-
-    print(f"  Period:  {start} to {end}")
-
-    print(f"  Days with tmax: {len(tmax_vals)}")
-
-    print(f"  Days with tmin: {len(tmin_vals)}")
-
-
-
-    if tmax_vals:
-
-        import numpy as np
-
-        print(f"  Tmax range: {min(tmax_vals):.1f} C to {max(tmax_vals):.1f} C "
-
-              f"(mean: {np.mean(tmax_vals):.1f} C)")
-
-    if tmin_vals:
-
-        import numpy as np
-
-        print(f"  Tmin range: {min(tmin_vals):.1f} C to {max(tmin_vals):.1f} C "
-
-              f"(mean: {np.mean(tmin_vals):.1f} C)")
-
-
-
-    print(f"\n  ℹ Calibration pairs require stored forecast data.")
-
-    print(f"    Run the pipeline with logging enabled to build forecast history,")
-
-    print(f"    then re-run calibrate to compute bias corrections.\n")
+    asyncio.run(_do())
 
 
 
