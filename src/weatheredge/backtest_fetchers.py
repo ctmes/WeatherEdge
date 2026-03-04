@@ -17,6 +17,7 @@ from typing import Any
 import httpx
 
 from weatheredge.config import (
+    OPEN_METEO_API_KEY,
     OPEN_METEO_HISTORICAL,
     OPEN_METEO_MODELS,
     POLYMARKET_GAMMA_BASE,
@@ -110,12 +111,22 @@ async def fetch_resolved_markets(
                 "end_date_min": start.isoformat() + "T00:00:00Z",
                 "end_date_max": end.isoformat() + "T23:59:59Z",
             }
-            try:
-                resp = await client.get(url, params=params)
-                resp.raise_for_status()
-                data = resp.json()
-            except Exception as e:
-                log.warning("Gamma fetch failed (offset=%d): %s", offset, e)
+            import asyncio
+            for attempt in range(3):
+                try:
+                    resp = await client.get(url, params=params)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        log.warning("Gamma fetch warn (offset=%d, attempt=%d): %s", offset, attempt, e)
+                        await asyncio.sleep(2 ** attempt)
+                    else:
+                        log.warning("Gamma fetch failed (offset=%d): %s", offset, e)
+                        data = None
+            
+            if data is None:
                 break
 
             if not data:
@@ -123,6 +134,10 @@ async def fetch_resolved_markets(
 
             for item in data:
                 if _is_weather_market(item):
+                    # Reject global climate anomaly markets (not city-level)
+                    parsed_check = _raw_to_parsed_market(item)
+                    if parsed_check and parsed_check.station_id == "GLOBAL":
+                        continue
                     # Filter by resolution date within our window
                     end_date_str = item.get("endDate", "")
                     if end_date_str:
@@ -159,7 +174,7 @@ async def fetch_resolved_daily_events(
     start: date,
     end: date,
     *,
-    max_pages: int = 100,
+    max_pages: int = 500,
     page_size: int = 100,
 ) -> list[tuple[ParsedMarket, dict]]:
     """
@@ -193,13 +208,25 @@ async def fetch_resolved_daily_events(
                 "limit": page_size,
                 "offset": offset,
                 "closed": "true",
+                "end_date_min": start.isoformat() + "T00:00:00Z",
+                "end_date_max": end.isoformat() + "T23:59:59Z",
             }
-            try:
-                resp = await client.get(url, params=params)
-                resp.raise_for_status()
-                data = resp.json()
-            except Exception as e:
-                log.warning("Gamma event fetch failed (offset=%d): %s", offset, e)
+            import asyncio
+            for attempt in range(3):
+                try:
+                    resp = await client.get(url, params=params)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        log.warning("Gamma event fetch warn (offset=%d, attempt=%d): %s", offset, attempt, e)
+                        await asyncio.sleep(2 ** attempt)
+                    else:
+                        log.warning("Gamma event fetch failed (offset=%d): %s", offset, e)
+                        data = None
+            
+            if data is None:
                 break
 
             if not data:
@@ -345,6 +372,8 @@ async def fetch_historical_forecast(
             "start_date": valid_date.isoformat(),
             "end_date": valid_date.isoformat(),
         }
+        if OPEN_METEO_API_KEY:
+            params["apikey"] = OPEN_METEO_API_KEY
         # Only add models param for non-default models
         if model:
             params["models"] = model
@@ -374,6 +403,9 @@ async def fetch_historical_forecast(
             )
             return None
 
+    if cached is None:
+        return None
+
     daily = cached.get("daily", {})
     dates = daily.get("time", [])
     tmax_vals = daily.get("temperature_2m_max", [])
@@ -389,17 +421,27 @@ async def fetch_historical_forecast(
     if tmax is None:
         return None
 
-    # For a single deterministic value, use a default std
-    # (ensemble spread isn't available from the historical API for a single model)
-    DEFAULT_STD = 2.0
+    # For a single deterministic value, estimate std based on typical forecast
+    # skill.  ECMWF 1-day TMAX RMSE is ~1.0°C; skill degrades ~0.15°C/day.
+    # Previous value of 2.0°C was far too wide — on Polymarket's 1°F (~0.55°C)
+    # bins it flattens probabilities across 4+ bins, destroying any useful signal.
+    # Previous value of 2.0°C was far too wide.
+    # New value of 1.0°C was too narrow for some stations.
+    BASE_STD = 1.5  # 1-day deterministic NWP RMSE (°C)
+    LEAD_DEGRADATION = 0.15  # °C per additional day of lead time
+
+    # Estimate lead time: difference between when we'd make the forecast and
+    # the valid date. Conservative: assume 1-day lead for historical replays.
+    lead_days = 1
+    default_std = BASE_STD + LEAD_DEGRADATION * max(0, lead_days - 1)
 
     return ForecastResult(
         station_id="",  # filled by caller
         valid_date=valid_date,
         tmax_mean=float(tmax),
-        tmax_std=DEFAULT_STD,
+        tmax_std=default_std,
         tmin_mean=float(tmin) if tmin is not None else None,
-        tmin_std=DEFAULT_STD,
+        tmin_std=default_std,
         models_used=[model],
     )
 
@@ -444,8 +486,8 @@ async def fetch_historical_forecast_ensemble(
         station_id="",
         valid_date=valid_date,
         tmax_mean=float(np.mean(tmax_arr)),
-        tmax_std=float(np.std(tmax_arr)) if len(tmax_arr) > 1 else 2.0,
+        tmax_std=float(max(1.0, np.std(tmax_arr))) if len(tmax_arr) > 1 else 1.5,
         tmin_mean=float(np.mean(tmin_arr)) if tmin_arr is not None and len(tmin_arr) > 0 else None,
-        tmin_std=float(np.std(tmin_arr)) if tmin_arr is not None and len(tmin_arr) > 1 else 2.0,
+        tmin_std=float(max(1.0, np.std(tmin_arr))) if tmin_arr is not None and len(tmin_arr) > 1 else 1.5,
         models_used=used,
     )

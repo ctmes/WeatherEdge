@@ -14,7 +14,7 @@ from typing import Any
 import httpx
 import numpy as np
 
-from weatheredge.config import FORECAST_DAYS, OPEN_METEO_BASE, OPEN_METEO_MODELS
+from weatheredge.config import FORECAST_DAYS, OPEN_METEO_BASE, OPEN_METEO_MODELS, OPEN_METEO_API_KEY
 from weatheredge.models import ForecastResult
 
 OPEN_METEO_ENSEMBLE = "https://ensemble-api.open-meteo.com/v1/ensemble"
@@ -54,8 +54,23 @@ async def fetch_forecast(
 
     Returns one ForecastResult per forecast day with proper probabilistic uncertainty.
     """
-    # Try ensemble first (51 members = real uncertainty)
+    # 1. Try Ensemble(s)
+    # Check if we should blend BOM for AU/NZ
+    # (Rough bounding box for AU/NZ: -50 < lat < -10 and 110 < lon < 185)
+    is_au_nz = -50 < latitude < -10 and 110 < longitude < 185
+    
     ensemble_results = await _fetch_ensemble(latitude, longitude, timezone, forecast_days)
+    
+    if is_au_nz:
+        bom_ensemble = await _fetch_ensemble(
+            latitude, longitude, timezone, forecast_days, model="bom_access_global"
+        )
+        if bom_ensemble:
+
+
+            # Blend them
+            ensemble_results = _blend_ensembles(ensemble_results, bom_ensemble)
+
     if ensemble_results:
         return ensemble_results
 
@@ -63,6 +78,61 @@ async def fetch_forecast(
     models = models or OPEN_METEO_MODELS
     raw_forecasts = await _fetch_raw_multimodel(latitude, longitude, timezone, models, forecast_days)
     return _build_multimodel_ensemble(raw_forecasts, models)
+
+
+def _blend_ensembles(
+    e1: list[ForecastResult],
+    e2: list[ForecastResult],
+) -> list[ForecastResult]:
+    """
+    Blend two ensemble ForecastResult lists by pooling their members.
+    Assumes models_used identifies the members (51 for ECMWF, 18 for BOM).
+    """
+    results: list[ForecastResult] = []
+    e2_by_date = {r.valid_date: r for r in e2}
+
+    for r1 in e1:
+        valid_date = r1.valid_date
+        if valid_date not in e2_by_date:
+            results.append(r1)
+            continue
+
+        r2 = e2_by_date[valid_date]
+        
+        # Approximate blending by weighting by member count
+        # ECMWF = 51, BOM = 18
+        n1, n2 = 51, 18
+        # If it's already a blended ensemble, this logic might need care, 
+        # but for now we assume e1 is ECMWF and e2 is BOM.
+        
+        def _blend(m1: float, s1: float, m2: float, s2: float, c1: int, c2: int):
+            # Combined Mean
+            m_new = (m1 * c1 + m2 * c2) / (c1 + c2)
+            # Combined Variance: Var = [ (n1-1)s1^2 + (n2-1)s2^2 + n1*m1^2 + n2*m2^2 - (n1+n2)m_new^2 ] / (n1+n2-1)
+            v1, v2 = s1**2, s2**2
+            ss1 = (c1 - 1) * v1 + c1 * m1**2
+            ss2 = (c2 - 1) * v2 + c2 * m2**2
+            v_new = (ss1 + ss2 - (c1 + c2) * m_new**2) / (c1 + c2 - 1)
+            return m_new, float(np.sqrt(max(v_new, 0.01)))
+
+        tmax_m, tmax_s = _blend(r1.tmax_mean, r1.tmax_std, r2.tmax_mean, r2.tmax_std, n1, n2)
+        
+        tmin_m, tmin_s = None, None
+        if r1.tmin_mean is not None and r2.tmin_mean is not None:
+             tmin_m, tmin_s = _blend(r1.tmin_mean, r1.tmin_std or 2.0, r2.tmin_mean, r2.tmin_std or 2.0, n1, n2)
+
+        results.append(ForecastResult(
+            station_id=r1.station_id,
+            valid_date=valid_date,
+            tmax_mean=tmax_m,
+            tmax_std=tmax_s,
+            tmin_mean=tmin_m,
+            tmin_std=tmin_s,
+            models_used=sorted(list(set(r1.models_used + r2.models_used))),
+        ))
+
+    return results
+
 
 
 async def fetch_regime_data(
@@ -82,6 +152,8 @@ async def fetch_regime_data(
         "timezone": timezone,
         "forecast_days": forecast_days,
     }
+    if OPEN_METEO_API_KEY:
+        params["apikey"] = OPEN_METEO_API_KEY
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -135,9 +207,10 @@ async def _fetch_ensemble(
     lon: float,
     timezone: str,
     forecast_days: int,
+    model: str = "ecmwf_ifs",
 ) -> list[ForecastResult]:
     """
-    Fetch ECMWF ensemble (51 members) from Open-Meteo ensemble API.
+    Fetch ensemble (51 ECMWF members or 18 BOM members) from Open-Meteo ensemble API.
     Gives real probabilistic uncertainty instead of multi-model hack.
     """
     params = {
@@ -146,8 +219,10 @@ async def _fetch_ensemble(
         "daily": "temperature_2m_max,temperature_2m_min",
         "timezone": timezone,
         "forecast_days": forecast_days,
-        "models": "ecmwf_ifs",
+        "models": model,
     }
+    if OPEN_METEO_API_KEY:
+        params["apikey"] = OPEN_METEO_API_KEY
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -186,7 +261,7 @@ async def _fetch_ensemble(
                     tmax_std=2.0,  # default
                     tmin_mean=float(tmin_raw[i]) if i < len(tmin_raw) and tmin_raw[i] is not None else None,
                     tmin_std=2.0,
-                    models_used=["ecmwf_ifs_ensemble"],
+                    models_used=[f"{model}_ensemble"],
                 )
                 for i, d in enumerate(dates) if i < len(tmax_raw)
             ]
@@ -215,7 +290,7 @@ async def _fetch_ensemble(
             tmax_std=float(np.std(tmax_arr)),
             tmin_mean=float(np.mean(tmin_arr)) if tmin_arr is not None and len(tmin_arr) > 0 else None,
             tmin_std=float(np.std(tmin_arr)) if tmin_arr is not None and len(tmin_arr) > 1 else 2.0,
-            models_used=["ecmwf_ifs_ensemble"],
+            models_used=[f"{model}_ensemble"],
         ))
 
     return results
@@ -245,6 +320,8 @@ async def _fetch_raw_multimodel(
                 "timezone": timezone,
                 "forecast_days": forecast_days,
             }
+            if OPEN_METEO_API_KEY:
+                params["apikey"] = OPEN_METEO_API_KEY
 
             try:
                 resp = await client.get(OPEN_METEO_BASE, params=params)

@@ -68,12 +68,16 @@ def calculate_edge(
     market_prob: float,
     fee: float = TRADING.polymarket_fee,
     slippage: float = TRADING.assumed_slippage,
+    dynamic_slippage: float | None = None,
 ) -> float:
     """
     Net edge for a single outcome bin, accounting for slippage spread.
     Positive edge → bet YES.  Negative edge → consider NO.
+
+    If dynamic_slippage is provided, it overrides the static slippage default.
     """
-    raw_edge = model_prob - (market_prob + slippage)
+    effective_slip = dynamic_slippage if dynamic_slippage is not None else slippage
+    raw_edge = model_prob - (market_prob + effective_slip)
     return raw_edge - fee
 
 
@@ -82,10 +86,11 @@ def calculate_all_edges(
     market_probs: list[float],
     fee: float = TRADING.polymarket_fee,
     slippage: float = TRADING.assumed_slippage,
+    dynamic_slippage: float | None = None,
 ) -> list[float]:
     """Calculate net edge for every bin."""
     return [
-        calculate_edge(mp, mkt, fee, slippage)
+        calculate_edge(mp, mkt, fee, slippage, dynamic_slippage)
         for mp, mkt in zip(model_probs, market_probs)
     ]
 

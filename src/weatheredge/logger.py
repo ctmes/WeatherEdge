@@ -70,6 +70,8 @@ async def log_scan(
                     edge=sig.net_edge,
                     kelly_fraction=sig.kelly_fraction,
                     bet_size_usd=sig.recommended_bet_usd,
+                    regime_flags=sig.regime_flags,
+                    confidence_multiplier=sig.confidence_multiplier,
                     signal_type="paper",
                     created_at=scan_time,
                 )

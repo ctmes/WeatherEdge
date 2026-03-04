@@ -221,8 +221,11 @@ def _process_market(
     eval_date: date | None = None,
     current_market_exposure: float = 0.0,
     current_total_exposure: float = 0.0,
+    orderbooks: dict[str, dict] | None = None,
 ) -> tuple[list[EdgeSignal], dict[str, Any] | None]:
     """Generate EdgeSignals for one market, applying calibration + regime checks."""
+
+    from weatheredge.filters import check_midpoint_integrity
 
     detail: dict[str, Any] = {
         "question": market.question[:80],
@@ -320,18 +323,69 @@ def _process_market(
         TRADING.min_edge_threshold, regime_assessment
     )
 
+    # Estimate dynamic slippage based on market volume
+    from weatheredge.slippage import estimate_slippage
+
     signals: list[EdgeSignal] = []
     for i, (mp, mkt_p) in enumerate(zip(model_probs, market_probs)):
         detail["bins_evaluated"] += 1
-        edge = calculate_edge(mp, mkt_p)
+
+        # First pass: estimate edge with a preliminary slippage to check threshold
+        preliminary_slip = estimate_slippage(
+            bet_size_usd=bankroll * 0.01,  # rough estimate for initial screening
+            market_volume=market.volume,
+        )
+        edge = calculate_edge(mp, mkt_p, dynamic_slippage=preliminary_slip)
+
+        # -- Adversary Filter: Midpoint Integrity ---------------------
+        integrity_multiplier = 1.0
+        if orderbooks:
+            # For daily events, token_ids map one-to-one with bins
+            tid = market.token_ids[i] if i < len(market.token_ids) else None
+            book = orderbooks.get(tid) if tid else None
+            if book:
+                integrity = check_midpoint_integrity(book.get("bids"), book.get("asks"))
+                integrity_multiplier = integrity["multiplier"]
+                if integrity["is_spooky"]:
+                    logger.warning(
+                        "Market %s bin %d classified as spooky: %s (multiplier %.2f)",
+                        market.condition_id, i, integrity["reason"], integrity_multiplier
+                    )
+            elif len(market.token_ids) == 0:
+                # Binary market fallback
+                book = orderbooks.get(market.condition_id)
+                if book:
+                    integrity = check_midpoint_integrity(book.get("bids"), book.get("asks"))
+                    integrity_multiplier = integrity["multiplier"]
+
+        # Apply regime + integrity multipliers
+        combined_multiplier = regime_assessment.confidence_multiplier * integrity_multiplier
 
         # Apply regime confidence multiplier to sizing
         if edge >= edge_threshold:
-            adjusted_edge = edge * regime_assessment.confidence_multiplier
+            adjusted_edge = edge * combined_multiplier
             kf = kelly_fraction(adjusted_edge)
             bet = recommended_bet_usd(adjusted_edge, bankroll)
 
             # Cap bet to max allowed (3% per config/safety)
+            if bet > bankroll * 0.03:
+                bet = bankroll * 0.03
+
+            # Refine slippage now that we know the actual bet size
+            dyn_slippage = estimate_slippage(
+                bet_size_usd=bet,
+                market_volume=market.volume,
+            )
+
+            # Recalculate edge with refined slippage
+            refined_edge = calculate_edge(mp, mkt_p, dynamic_slippage=dyn_slippage)
+            if refined_edge < edge_threshold:
+                # Edge evaporated once we accounted for realistic slippage
+                continue
+
+            adjusted_edge = refined_edge * regime_assessment.confidence_multiplier
+            kf = kelly_fraction(adjusted_edge)
+            bet = recommended_bet_usd(adjusted_edge, bankroll)
             if bet > bankroll * 0.03:
                 bet = bankroll * 0.03
 
@@ -357,11 +411,13 @@ def _process_market(
                     bin_range=bins[i],
                     model_prob=mp,
                     market_prob=mkt_p,
-                    raw_edge=mp - (mkt_p + TRADING.assumed_slippage),
-                    net_edge=edge,
+                    raw_edge=mp - (mkt_p + dyn_slippage),
+                    net_edge=refined_edge,
                     kelly_fraction=kf,
                     recommended_bet_usd=bet,
-                    slippage=TRADING.assumed_slippage,
+                    regime_flags=regime_assessment.flags,
+                    confidence_multiplier=regime_assessment.confidence_multiplier,
+                    slippage=dyn_slippage,
                 )
             )
 

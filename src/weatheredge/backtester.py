@@ -113,6 +113,10 @@ class BacktestConfig(TypedDict, total=False):
 
     calibrations: dict   # {station_id: StationBias} — passed through to pipeline
 
+    data_source: str     # "gamma" (default) or "pmxt" (archive.pmxt.dev)
+
+    walk_forward: bool   # Enable monthly recalibration to prevent lookahead bias
+
 
 
 
@@ -160,6 +164,11 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
     mode = cfg.get("mode", "brier_only")
 
     calibrations = cfg.get("calibrations", {})
+    data_source = cfg.get("data_source", "gamma")
+    walk_forward = cfg.get("walk_forward", False)
+
+    # Cache for walk-forward calibrations: {(year, month): {station_id: StationBias}}
+    wf_cal_cache: dict[tuple[int, int], dict[str, Any]] = {}
 
 
 
@@ -192,19 +201,20 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
 
     # -- 2. Fetch resolved markets ------------------------------------
 
-    # We fetch both legacy "markets" (global anomalies) and new "daily events"
-
-    legacy_market_pairs = await fetch_resolved_markets(start, end)
-
-    daily_event_pairs = await fetch_resolved_daily_events(start, end)
-
-    
-
-    market_pairs = legacy_market_pairs + daily_event_pairs
-
-    log.info("Found %d total resolved weather markets (%d legacy, %d daily events)", 
-
-             len(market_pairs), len(legacy_market_pairs), len(daily_event_pairs))
+    if data_source == "pmxt":
+        from weatheredge.pmxt_fetcher import fetch_pmxt_resolved_markets
+        latency_s = cfg.get("latency_seconds", 60)
+        market_pairs = await fetch_pmxt_resolved_markets(
+            start, end, model_name=model, latency_seconds=latency_s
+        )
+        log.info("Found %d weather markets from pmxt archive", len(market_pairs))
+    else:
+        # Default: fetch from Gamma API
+        legacy_market_pairs = await fetch_resolved_markets(start, end)
+        daily_event_pairs = await fetch_resolved_daily_events(start, end)
+        market_pairs = legacy_market_pairs + daily_event_pairs
+        log.info("Found %d total resolved weather markets (%d legacy, %d daily events)", 
+                 len(market_pairs), len(legacy_market_pairs), len(daily_event_pairs))
 
 
 
@@ -351,9 +361,8 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
 
     print("-" * 60)
 
-
-
-    for parsed, raw in market_pairs:
+    from tqdm import tqdm
+    for parsed, raw in tqdm(market_pairs, desc="Backtesting", unit="mkt", ncols=80):
 
         try:
 
@@ -361,6 +370,11 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
 
             if not parsed.station_id:
 
+                continue
+
+            # Skip global climate anomaly markets — not city-level temperature
+            if parsed.station_id == "GLOBAL":
+                log.debug("Skipping global climate market: %s", parsed.question[:60])
                 continue
 
 
@@ -431,17 +445,37 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
 
             rg_by_date: dict[date, AtmosphericRegime] = {}
 
-            station_cal = calibrations.get(parsed.station_id)
+            # -- 4. Calibration -------------------------------------------
+            if walk_forward:
+                wf_key = (decision_date.year, decision_date.month)
+                if wf_key not in wf_cal_cache:
+                    wf_cal_cache[wf_key] = {}
+                
+                if parsed.station_id not in wf_cal_cache[wf_key]:
+                    from weatheredge.calibration import run_calibration
+                    # Calibrate using data up to the day before making the decision
+                    bias, _ = await run_calibration(
+                        parsed.station_id, 
+                        days=365, 
+                        end_date=decision_date - timedelta(days=1)
+                    )
+                    wf_cal_cache[wf_key][parsed.station_id] = bias
+                
+                station_cal = wf_cal_cache[wf_key][parsed.station_id]
+            else:
+                station_cal = calibrations.get(parsed.station_id)
 
             if brier_only:
                 # Skip edge/Kelly/P&L — just compute Brier below
                 signals = []
             else:
+                obs = raw.get("_pmxt_orderbook")
                 signals, _detail = _process_market(
                     parsed, fc_by_date, rg_by_date, station_cal, rolling_bankroll,
                     eval_date=decision_date,
-                    current_market_exposure=market_exposures.get(parsed.condition_id, 0.0),
-                    current_total_exposure=total_exposure,
+                    current_market_exposure=0.0,
+                    current_total_exposure=0.0,
+                    orderbooks=obs,
                 )
 
 
@@ -470,8 +504,8 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
 
             # Live Ticker Header
             q_safe = parsed.question.encode("ascii", "ignore").decode("ascii")
-            print(f"\n[{decision_date}] {q_safe[:50]}...")
-            print(f"  Forecast: {forecast.tmax_mean:.1f}C (std={forecast.tmax_std:.1f})")
+            
+            # Print removed to prevent spamming tqdm bar. Handled below only on trade signals.
 
             # Brier score (always compute when possible, even if no signals)
             from weatheredge.probability import forecast_to_probabilities
@@ -480,23 +514,40 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
             bins = parse_bins_from_outcomes(parsed.outcomes) if not parsed.bins else parsed.bins
             if bins and forecast:
                 metric = parsed.metric or "tmax"
-                if metric == "tmin" and forecast.tmin_mean is not None:
-                    mean_val = forecast.tmin_mean
-                    std_val = forecast.tmin_std or 2.0
+                # -- Probability Calculation (with Calibration) ---
+                from weatheredge.calibration import apply_calibration, apply_calibration_std
+                
+                raw_mean = forecast.tmax_mean if parsed.metric == "tmax" else (forecast.tmin_mean or 0)
+                raw_std = forecast.tmax_std if parsed.metric == "tmax" else (forecast.tmin_std or 1.5)
+                
+                if station_cal:
+                    cal_mean = apply_calibration(raw_mean, station_cal, target_date, metric=parsed.metric)
+                    cal_std = apply_calibration_std(raw_std, station_cal)
                 else:
-                    mean_val = forecast.tmax_mean
-                    std_val = forecast.tmax_std
+                    cal_mean = raw_mean
+                    cal_std = raw_std
 
-                model_probs = forecast_to_probabilities(mean_val, std_val, bins)
+                model_probs = forecast_to_probabilities(
+                    cal_mean,
+                    cal_std,
+                    bins,
+                )
                 bs = brier_score(model_probs, resolved_bin)
+
+                # Baseline: Uniform probability (1/N)
+                num_bins = len(bins)
+                baseline_probs = [1.0 / num_bins] * num_bins
+                bbs = brier_score(baseline_probs, resolved_bin)
+
                 brier_scores.append({
                     "market_id": parsed.condition_id,
+                    "station_id": parsed.station_id,
                     "model": model if not use_ensemble else "ensemble",
                     "brier": bs,
+                    "baseline_brier": bbs,
                 })
 
             if not signals:
-                print("  Signals:  None")
                 continue
 
             for sig in signals:
@@ -515,9 +566,13 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
 
                 # Color coding (ANSI)
                 win_loss_label = "\033[92mWIN\033[0m" if won else "\033[91mLOSS\033[0m"
+                resolved_label = parsed.outcomes[resolved_bin] if resolved_bin < len(parsed.outcomes) else f"Bin {resolved_bin}"
                 
-                print(f"  Signal:   {sig.bin_label} | Edge: {sig.net_edge:+.1%} | Bet: ${sig.recommended_bet_usd:.0f}")
-                print(f"  Result:   {win_loss_label} | P&L: {pnl:+.2f} | Bankroll: ${rolling_bankroll:,.0f}")
+                tqdm.write(f"\n[{decision_date}] {q_safe[:65]}")
+                tqdm.write(f"  Forecast: {forecast.tmax_mean:.1f}°C (std={forecast.tmax_std:.1f})")
+                tqdm.write(f"  Bet:      \033[1m{sig.bin_label}\033[0m @ {sig.model_prob:.0%} model vs {sig.market_prob:.0%} market")
+                tqdm.write(f"  Slippage: {sig.slippage:.1%} | Edge: {sig.net_edge:+.1%} | Size: ${sig.recommended_bet_usd:.0f}")
+                tqdm.write(f"  Actual:   {resolved_label} → {win_loss_label} | P&L: {pnl:+.2f} | Bankroll: ${rolling_bankroll:,.0f}")
 
                 all_signals.append(sig)
                 all_results.append({
@@ -526,18 +581,34 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
                     "pnl": pnl,
                     "resolved_bin": resolved_bin,
                     "decision_date": decision_date,
+                    "resolved_label": resolved_label,
+                    "forecast_mean": forecast.tmax_mean,
                 })
 
         except Exception as e:
             log.warning("Backtester failed to process market %s: %s", parsed.condition_id, e)
 
     
-
     print("\n" + "-" * 60)
-
-
-
-
+    # -- Trade Detail Table -------------------------------------------
+    if all_results:
+        print(f"\n{'='*90}")
+        print(f"{'TRADE LOG':^90}")
+        print(f"{'='*90}")
+        print(f"{'Date':<12} {'Market':<30} {'Bet On':<16} {'Actual':<16} {'P&L':>8} {'W/L':>5}")
+        print(f"{'-'*12} {'-'*30} {'-'*16} {'-'*16} {'-'*8} {'-'*5}")
+        for r in all_results:
+            sig = r["signal"]
+            q_short = sig.question.encode('ascii', 'ignore').decode('ascii')[:30]
+            bet_label = sig.bin_label[:16]
+            actual = r.get("resolved_label", f"Bin {r['resolved_bin']}")[:16]
+            wl = "✓" if r["won"] else "✗"
+            print(f"{r['decision_date']}  {q_short:<30} {bet_label:<16} {actual:<16} {r['pnl']:>+8.2f} {wl:>5}")
+        print(f"{'='*90}")
+        wins = sum(1 for r in all_results if r["won"])
+        trade_pnl = sum(r["pnl"] for r in all_results)
+        print(f"Total: {len(all_results)} trades, {wins} wins, {len(all_results)-wins} losses, P&L: ${trade_pnl:+.2f}")
+        print(f"{'='*90}\n")
 
     # -- 6. Summary Stats & Persist -----------------------------------
     total_pnl = sum(r["pnl"] for r in all_results)
@@ -581,87 +652,46 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
     )
 
     async with get_session() as session:
-
         for record in all_results:
-
             sig = record["signal"]
-
             db_signal = Signal(
-
                 market_id=sig.market_id,
-
                 backtest_run_id=run_id,
-
                 bin_index=sig.bin_index,
-
                 model_prob=sig.model_prob,
-
                 market_prob=sig.market_prob,
-                
                 slippage=sig.slippage,
-
                 edge=sig.net_edge,
-
                 kelly_fraction=sig.kelly_fraction,
-
                 bet_size_usd=sig.recommended_bet_usd,
-
                 signal_type="backtest",
-
                 created_at=datetime.combine(record["decision_date"], datetime.min.time()),
-
             )
-
             session.add(db_signal)
-
             await session.flush()  # get db_signal.id
 
-
-
             session.add(Result(
-
                 signal_id=db_signal.id,
-
                 backtest_run_id=run_id,
-
                 resolved_bin=record["resolved_bin"],
-
                 won=record["won"],
-
                 pnl_usd=record["pnl"],
-
                 resolved_at=datetime.utcnow(),
-
             ))
-
-
 
         for bs_record in brier_scores:
-
             session.add(BrierScore(
-
                 backtest_run_id=run_id,
-
                 market_id=bs_record["market_id"],
-
                 model=bs_record["model"],
-
                 brier_score=bs_record["brier"],
-
             ))
 
-
-
         # Update BacktestRun with summary stats
-
         from sqlalchemy import update
-
         await session.execute(
-
             update(BacktestRun)
-
             .where(BacktestRun.id == run_id)
-
             .values(
                 finished_at=datetime.utcnow(),
                 markets_count=markets_processed,
@@ -673,40 +703,32 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
             )
         )
 
-
-
-    log.info(
-        "Backtest #%d complete: %d markets, %d signals, P&L=$%.2f, Brier=%.4f (BSS=%.2f)",
-        run_id, markets_processed, len(all_signals),
-        total_pnl, avg_brier or 0.0, bss,
-    )
-    
-    log.info(
-        "Performance: Sharpe=%.2f, MaxDD=%.1f%%, WinRate=[%.1f%% - %.1f%%]",
-        sharpe, mdd * 100, low_ci * 100, high_ci * 100
-    )
-
-
-
-    # Reload and return
+    # -- 5. PERSIST RESULTS -------------------------------------------
+    bt_run.finished_at = datetime.utcnow()
+    bt_run.markets_count = markets_processed
+    bt_run.signals_count = len(all_signals)
+    bt_run.total_pnl = total_pnl
+    bt_run.avg_brier = avg_brier
+    bt_run.max_drawdown = float(mdd)
+    bt_run.sharpe_ratio = float(sharpe)
 
     async with get_session() as session:
-
-        from sqlalchemy import select
-
-        result = await session.execute(
-
-            select(BacktestRun).where(BacktestRun.id == run_id)
-
+        # Update BacktestRun in DB
+        from sqlalchemy import update
+        await session.execute(
+            update(BacktestRun)
+            .where(BacktestRun.id == run_id)
+            .values(
+                finished_at=bt_run.finished_at,
+                markets_count=bt_run.markets_count,
+                signals_count=bt_run.signals_count,
+                total_pnl=bt_run.total_pnl,
+                avg_brier=bt_run.avg_brier,
+                max_drawdown=bt_run.max_drawdown,
+                sharpe_ratio=bt_run.sharpe_ratio,
+            )
         )
-
-        return result.scalar_one()
-
-
-
-
-
-# ---------------------------------------------------------------------------
+    return bt_run
 
 # Internals
 

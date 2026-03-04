@@ -96,13 +96,51 @@ NON_WEATHER_BLOCKLIST: list[str] = [
 
 
 # ---------------------------------------------------------------------------
+# pmxt Archive
+# ---------------------------------------------------------------------------
+
+PMXT_ARCHIVE_BASE = "https://r2.pmxt.dev"
+
+# Slug / title fragments used to identify weather markets in pmxt archive data.
+# Applied case-insensitively against market_slug and title columns.
+PMXT_WEATHER_SLUGS: list[str] = [
+    "temperature", "temp", "rain", "precip", "snow", "weather",
+    "heat", "cold", "frost", "wind", "storm", "hurricane",
+    "tornado", "blizzard", "hail", "drought", "flood",
+    "celsius", "fahrenheit", "highest-temperature", "lowest-temperature",
+]
+
+
+# ---------------------------------------------------------------------------
 # Open-Meteo
 # ---------------------------------------------------------------------------
 
-OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast"
-OPEN_METEO_HISTORICAL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
-OPEN_METEO_MODELS: list[str] = ["ecmwf_ifs", "gfs_seamless", "gem_seamless"]
+OPEN_METEO_API_KEY = os.getenv("OPEN_METEO_API_KEY")
+
+if OPEN_METEO_API_KEY:
+    OPEN_METEO_BASE = "https://customer-api.open-meteo.com/v1/forecast"
+    OPEN_METEO_HISTORICAL = "https://customer-historical-forecast-api.open-meteo.com/v1/forecast"
+else:
+    OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast"
+    OPEN_METEO_HISTORICAL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+
+OPEN_METEO_MODELS: list[str] = ["ecmwf_ifs", "gfs_seamless", "gem_seamless", "bom_access_global"]
 FORECAST_DAYS: int = 7
+
+# typical public release times in UTC (hours, minutes) for NWP models.
+# bots usually frontrun these seconds after they arrive at Open-Meteo/NOMADS.
+MODEL_RELEASE_CHART = {
+    "ecmwf_ifs": {
+        "00": (6, 50),
+        "12": (18, 50),
+    },
+    "gfs_seamless": {
+        "00": (3, 45),
+        "06": (9, 45),
+        "12": (15, 45),
+        "18": (21, 45),
+    }
+}
 
 
 # ---------------------------------------------------------------------------

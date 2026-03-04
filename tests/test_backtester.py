@@ -525,3 +525,65 @@ class TestBacktesterFixes:
         assert len(received_calibrations) > 0, "_process_market was never called"
         assert received_calibrations[0] is test_bias, \
             f"Expected StationBias for NZWN, got {received_calibrations[0]}"
+
+    async def test_global_station_skipped(self):
+        """
+        Markets with station_id='GLOBAL' (climate anomaly questions) should
+        be skipped — they fetch forecasts for lat=0/lon=0 which is nonsense.
+        """
+        from weatheredge.backtester import run_backtest
+        from weatheredge.models import ForecastResult, ParsedMarket
+
+        raw = _make_gamma_market(
+            condition_id="global-climate-001",
+            question="Will 2024 be the hottest year on record?",
+            outcomes="Yes,No",
+            outcome_prices="0.85,0.15",
+            resolved_prices="1.0,0.0",
+        )
+        parsed = ParsedMarket(
+            condition_id="global-climate-001",
+            question="Will 2024 be the hottest year on record?",
+            outcomes=["Yes", "No"],
+            outcome_prices=[0.85, 0.15],
+            token_ids=["tok1", "tok2"],
+            volume=50000,
+            end_date="2025-02-28T00:00:00Z",
+            description="Global temperature anomaly market.",
+            station_id="GLOBAL",  # <-- pseudo-station
+            metric="tmax",
+            bins=[(float("-inf"), float("inf")), (float("-inf"), float("inf"))],
+            resolution_date=date(2025, 2, 28),
+        )
+
+        mock_forecast = ForecastResult(
+            station_id="GLOBAL",
+            valid_date=date(2025, 2, 28),
+            tmax_mean=29.0,
+            tmax_std=2.0,
+            models_used=["ecmwf_ifs"],
+        )
+
+        with patch(
+            "weatheredge.backtester.fetch_resolved_markets",
+            new_callable=AsyncMock,
+            return_value=[(parsed, raw)],
+        ), patch(
+            "weatheredge.backtester.fetch_resolved_daily_events",
+            new_callable=AsyncMock,
+            return_value=[],
+        ), patch(
+            "weatheredge.backtester.fetch_historical_forecast",
+            new_callable=AsyncMock,
+            return_value=mock_forecast,
+        ):
+            bt_run = await run_backtest({
+                "start_date": "2025-02-01",
+                "end_date": "2025-02-28",
+                "mode": "full_sim",
+            })
+
+        # GLOBAL station market must be skipped — 0 markets processed
+        assert bt_run.markets_count == 0, \
+            f"GLOBAL station market should be skipped, but {bt_run.markets_count} were processed"
+

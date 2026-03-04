@@ -28,6 +28,24 @@ def brier_skill_score(model_brier: float, baseline_brier: float) -> float:
     return 1 - (model_brier / baseline_brier)
 
 
+def calculate_climatological_baseline(bins: list[tuple[float, float]], hist_mean: float, hist_std: float) -> float:
+    """
+    Calculate the Brier Score our model would get if it just guessed 
+    probabilities based on historical averages (Section 7.2 of Godpaper).
+    Used as the 'Reference Brier' for BSS.
+    """
+    from weatheredge.probability import forecast_to_probabilities
+    
+    # We assume 'truth' is the historical mean for this baseline calculation
+    # to find what the BS would be for a naive forecast.
+    probs = forecast_to_probabilities(hist_mean, hist_std, bins)
+    
+    # Simple multi-category Brier: sum of squared errors
+    # In a theoretical baseline, we can use the sum of squares of the probabilities
+    # as an expected Brier score if the outcomes follow the historical distribution.
+    return float(np.sum(np.square(probs)))
+
+
 def reliability_diagram_data(
     predicted_probs: list[float], 
     outcomes: list[int], 
@@ -162,3 +180,31 @@ def conservative_kelly(
         
     # Hard cap at 5% as per Quant persona
     return min(fk, 0.05)
+
+
+def aggregate_station_metrics(brier_scores: list[dict]) -> dict[str, dict[str, Any]]:
+    """
+    Aggregate Brier scores and skill scores per station.
+    brier_scores: list of dicts with ['market_id', 'station_id', 'brier', 'baseline_brier']
+    """
+    stations = {}
+    for entry in brier_scores:
+        sid = entry.get('station_id', 'unknown')
+        if sid not in stations:
+            stations[sid] = {'brier_sum': 0.0, 'baseline_sum': 0.0, 'count': 0}
+        
+        stations[sid]['brier_sum'] += entry['brier']
+        stations[sid]['baseline_sum'] += entry.get('baseline_brier', 0.5)
+        stations[sid]['count'] += 1
+        
+    results = {}
+    for sid, data in stations.items():
+        avg_brier = data['brier_sum'] / data['count']
+        avg_baseline = data['baseline_sum'] / data['count']
+        results[sid] = {
+            'avg_brier': avg_brier,
+            'avg_baseline': avg_baseline,
+            'bss': brier_skill_score(avg_brier, avg_baseline),
+            'count': data['count']
+        }
+    return results

@@ -129,6 +129,8 @@ class Signal(Base):
     edge = Column(Float)
     kelly_fraction = Column(Float)
     bet_size_usd = Column(Float)
+    regime_flags = Column(JSON, nullable=True)        # e.g. {"stale_data": True}
+    confidence_multiplier = Column(Float, default=1.0)
     signal_type = Column(String, default="paper")    # paper | real | backtest
     created_at = Column(DateTime, server_default=func.now())
 
@@ -148,6 +150,8 @@ class Result(Base):
     resolved_bin = Column(Integer)
     won = Column(Boolean)
     pnl_usd = Column(Float)
+    actual_fill_price = Column(Float, nullable=True)
+    actual_slippage = Column(Float, nullable=True)
     resolved_at = Column(DateTime)
 
     signal = relationship("Signal", back_populates="result")
@@ -186,6 +190,7 @@ class BrierScore(Base):
     market_id = Column(String, index=True)
     model = Column(String)
     brier_score = Column(Float)
+    baseline_brier = Column(Float, nullable=True)    # For BSS calculation
     calculated_at = Column(DateTime, server_default=func.now())
 
     backtest_run = relationship("BacktestRun", back_populates="brier_scores")
@@ -246,4 +251,6 @@ class EdgeSignal:
     net_edge: float
     kelly_fraction: float
     recommended_bet_usd: float
+    regime_flags: dict[str, Any] = field(default_factory=dict)
+    confidence_multiplier: float = 1.0
     slippage: float = 0.0

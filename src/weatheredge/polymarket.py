@@ -251,6 +251,24 @@ def _raw_to_parsed_market(item: dict) -> ParsedMarket | None:
                         market.station_id = v
                         break
 
+        # --- Unit Normalization ---
+        # Definitive fix: everything normalized to Celsius for probability.py
+        from weatheredge.stations import get_station
+        station = get_station(market.station_id) if market.station_id else None
+        
+        # Use station preferred unit as primary hint, fallback to text detection
+        detected_unit = _detect_unit(question + " " + description + " " + group_title)
+        market_unit = station.preferred_unit if (station and station.preferred_unit) else detected_unit
+
+        if market_unit == "F" and market.bins:
+            # Convert ºF bins to ºC
+            new_bins = []
+            for low, high in market.bins:
+                c_low = fahrenheit_to_celsius(low) if low != float("-inf") else float("-inf")
+                c_high = fahrenheit_to_celsius(high) if high != float("inf") else float("inf")
+                new_bins.append((c_low, c_high))
+            market.bins = new_bins
+
         return market
     except Exception:
         return None
@@ -480,16 +498,28 @@ def fahrenheit_to_celsius(f: float) -> float:
 def _detect_unit(text: str) -> str:
     """Detect if Fahrenheit or Celsius from text."""
     search = text.lower()
-    if "fahrenheit" in search or "degrees f" in search:
-        return "F"
-    if "celsius" in search or "degrees c" in search:
+    
+    # Check for explicit phrases first
+    if "degrees celsius" in search or "degrees c" in search:
         return "C"
-    # Micro-weather markets often omit the full name
-    if "°f" in search or " f " in search or " f." in search:
+    if "degrees fahrenheit" in search or "degrees f" in search:
         return "F"
-    if "°c" in search or " c " in search or " c." in search:
+        
+    # Check for symbols with numbers
+    if re.search(r"\d+\s*°c", search) or re.search(r"\bcelsius\b", search):
         return "C"
-    return "C"  # Default to Celsius for international safety
+    if re.search(r"\d+\s*°f", search) or re.search(r"\bfahrenheit\b", search):
+        return "F"
+        
+    # If both or neither, check for symbols
+    if "°c" in search:
+        return "C"
+    if "°f" in search:
+        return "F"
+        
+    # Default to Celsius for international safety, 
+    # but the calling code should prioritize station metadata.
+    return "C"
 
 
 def _extract_city_from_title(title: str) -> str | None:
@@ -597,6 +627,8 @@ def parse_daily_weather_event(event: dict) -> ParsedMarket | None:
     bins: list[tuple[float, float]] = []
     outcome_prices: list[float] = []  # Yes price for each bin
     outcomes: list[str] = []
+    child_condition_ids: list[str] = []  # conditionId per child (for order book lookup)
+    child_token_ids: list[str] = []  # YES clobTokenId per child (PMXT market_id)
     winning_bin: int | None = None
     
     for i, m in enumerate(sorted_markets):
@@ -617,6 +649,20 @@ def parse_daily_weather_event(event: dict) -> ParsedMarket | None:
             bin_tuple = (low, high)
         
         bins.append(bin_tuple)
+        
+        # Collect child market IDs for PMXT order book mapping
+        child_cid = m.get("conditionId", m.get("id", ""))
+        child_condition_ids.append(child_cid)
+        
+        # clobTokenIds: first token is usually the YES token
+        clob_raw = m.get("clobTokenIds", "")
+        if isinstance(clob_raw, str):
+            clob_parts = [t.strip() for t in clob_raw.split(",") if t.strip()]
+        elif isinstance(clob_raw, list):
+            clob_parts = [str(t) for t in clob_raw]
+        else:
+            clob_parts = []
+        child_token_ids.append(clob_parts[0] if clob_parts else child_cid)
         
         # Extract the Yes price for this bin
         prices_raw = m.get("outcomePrices", "")
@@ -640,13 +686,15 @@ def parse_daily_weather_event(event: dict) -> ParsedMarket | None:
     if not bins:
         return None
     
-    # Build the ParsedMarket
+    # Build the ParsedMarket — token_ids stores child clobTokenIds for order book
+    # mapping.  child_condition_ids are stored as a comma-joined string in the
+    # description footer so the PMXT enricher can recover them.
     market = ParsedMarket(
         condition_id=event.get("id", ""),
         question=title,
         outcomes=outcomes,
         outcome_prices=outcome_prices,
-        token_ids=[],  # Not needed for backtesting
+        token_ids=child_token_ids,
         volume=float(event.get("volume", 0) or 0),
         end_date=end_date_str,
         description=markets[0].get("description", "") if markets else "",

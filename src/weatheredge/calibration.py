@@ -305,6 +305,7 @@ def pair_observations_with_forecasts(
 async def run_calibration(
     station_id: str,
     days: int = 365,
+    end_date: date | None = None,
 ) -> tuple[StationBias, dict[str, Any]]:
     """
     Standalone runner for station calibration (godpaper Section 6 / Quant Audit).
@@ -317,7 +318,10 @@ async def run_calibration(
     
     Returns (StationBias, metrics_dict).
     """
+    import asyncio
+    import numpy as np
     from datetime import date, timedelta
+    from weatheredge.calibration import StationBias, CalibrationPair, build_calibration, apply_calibration
     from weatheredge.backtest_fetchers import fetch_historical_forecast_ensemble
     from weatheredge.mesonet import fetch_daily_observations
     from weatheredge.stations import get_station
@@ -326,7 +330,7 @@ async def run_calibration(
     if not station:
         raise ValueError(f"Unknown station: {station_id}")
 
-    end = date.today() - timedelta(days=1)
+    end = end_date or (date.today() - timedelta(days=1))
     start = end - timedelta(days=days)
 
     logger.info("Fetching %d days of data for %s...", days, station_id)
