@@ -469,14 +469,22 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
                 # Skip edge/Kelly/P&L — just compute Brier below
                 signals = []
             else:
-                obs = raw.get("_pmxt_orderbook")
+                obs_t0 = raw.get("_pmxt_orderbook")
                 signals, _detail = _process_market(
                     parsed, fc_by_date, rg_by_date, station_cal, rolling_bankroll,
                     eval_date=decision_date,
                     current_market_exposure=0.0,
                     current_total_exposure=0.0,
-                    orderbooks=obs,
+                    orderbooks=obs_t0,
                 )
+                
+                # For actual slippage simulation in backtest:
+                # If we are using pmxt, we can fetch an orderbook a few minutes later.
+                # For simplicity in this loop, we'll re-use the t0 orderbook but 
+                # maybe add a small "latency shift" if we had the full archive access.
+                # In this Phase 1 backtester, we'll use the t0 observation 
+                # as both the "signal" price and the "fill" price, but the _process_market
+                # already separates estimated_slippage.
 
 
 
@@ -574,6 +582,11 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
                 tqdm.write(f"  Slippage: {sig.slippage:.1%} | Edge: {sig.net_edge:+.1%} | Size: ${sig.recommended_bet_usd:.0f}")
                 tqdm.write(f"  Actual:   {resolved_label} → {win_loss_label} | P&L: {pnl:+.2f} | Bankroll: ${rolling_bankroll:,.0f}")
 
+                # For backtesting, we simulate actual fill as market_prob + slippage
+                # where 'slippage' here is the one calculated by _process_market
+                actual_fill = min((sig.market_prob or 0.5) + sig.slippage, 0.99)
+                actual_slip = sig.slippage  # In backtest simple mode, they are the same
+                
                 all_signals.append(sig)
                 all_results.append({
                     "signal": sig,
@@ -583,6 +596,8 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
                     "decision_date": decision_date,
                     "resolved_label": resolved_label,
                     "forecast_mean": forecast.tmax_mean,
+                    "actual_fill_price": actual_fill,
+                    "actual_slippage": actual_slip,
                 })
 
         except Exception as e:

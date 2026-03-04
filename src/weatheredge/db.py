@@ -69,11 +69,50 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 # ---------------------------------------------------------------------------
 
 async def init_db() -> None:
-    """Create all tables defined in ``models.Base.metadata``."""
+    """Create all tables defined in ``models.Base.metadata`` and apply missing columns."""
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    logger.info("Database tables initialised.")
+
+        # Handle lightweight migrations for SQLite
+        def _migrate_sync(connection):
+            from sqlalchemy import text
+            
+            # Get existing columns for signals
+            cursor = connection.execute(text("PRAGMA table_info(signals)"))
+            signals_cols = [row[1] for row in cursor.fetchall()]
+            
+            if "confidence_multiplier" not in signals_cols:
+                logger.info("Auto-migrating: adding 'confidence_multiplier' to 'signals'")
+                connection.execute(text("ALTER TABLE signals ADD COLUMN confidence_multiplier FLOAT DEFAULT 1.0"))
+            
+            if "regime_flags" not in signals_cols:
+                logger.info("Auto-migrating: adding 'regime_flags' to 'signals'")
+                connection.execute(text("ALTER TABLE signals ADD COLUMN regime_flags JSON"))
+
+            # Get existing columns for results
+            cursor = connection.execute(text("PRAGMA table_info(results)"))
+            results_cols = [row[1] for row in cursor.fetchall()]
+
+            if "actual_fill_price" not in results_cols:
+                logger.info("Auto-migrating: adding 'actual_fill_price' to 'results'")
+                connection.execute(text("ALTER TABLE results ADD COLUMN actual_fill_price FLOAT"))
+
+            if "actual_slippage" not in results_cols:
+                logger.info("Auto-migrating: adding 'actual_slippage' to 'results'")
+                connection.execute(text("ALTER TABLE results ADD COLUMN actual_slippage FLOAT"))
+
+            # Get existing columns for brier_scores
+            cursor = connection.execute(text("PRAGMA table_info(brier_scores)"))
+            brier_scores_cols = [row[1] for row in cursor.fetchall()]
+
+            if "baseline_brier" not in brier_scores_cols:
+                logger.info("Auto-migrating: adding 'baseline_brier' to 'brier_scores'")
+                connection.execute(text("ALTER TABLE brier_scores ADD COLUMN baseline_brier FLOAT"))
+
+        await conn.run_sync(_migrate_sync)
+    
+    logger.info("Database tables initialised and migrated.")
 
 
 async def upsert_market(session: AsyncSession, market_data: dict) -> None:
@@ -166,6 +205,30 @@ async def get_calibrations(session: AsyncSession) -> dict[str, Any]:
         calibrations[r.station_id] = bias
 
     return calibrations
+
+
+async def get_next_market_price(session: AsyncSession, market_id: str, after_timestamp: datetime) -> dict[int, float] | None:
+    """
+    Fetch the first market price recorded AFTER a given timestamp.
+    Used for paper trade slippage calculation (simulating price movement).
+    """
+    from sqlalchemy import select
+    from weatheredge.models import MarketPrice
+
+    stmt = (
+        select(MarketPrice)
+        .where(MarketPrice.market_id == market_id)
+        .where(MarketPrice.recorded_at > after_timestamp)
+        .order_by(MarketPrice.recorded_at.asc())
+        .limit(1)
+    )
+    result = await session.execute(stmt)
+    mp = result.scalar_one_or_none()
+    
+    if mp and mp.prices:
+        # Cast keys to int if they came back as strings from JSON
+        return {int(k): float(v) for k, v in mp.prices.items()}
+    return None
 
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,7 @@ import httpx
 from sqlalchemy import select, func
 
 from weatheredge.config import POLYMARKET_GAMMA_BASE
-from weatheredge.db import get_session
+from weatheredge.db import get_session, get_next_market_price
 from weatheredge.models import BrierScore, Market, Result, Signal
 from weatheredge.probability import brier_score
 
@@ -70,14 +70,35 @@ async def check_resolutions() -> int:
             resolve_time = datetime.utcnow()
 
             for sig in sigs:
+                # Try to find the "actual" market price shortly after the signal
+                # to simulate slippage/execution for paper trades.
+                next_prices = await get_next_market_price(session, sig.market_id, sig.created_at)
+                
+                actual_fill = None
+                actual_slip = None
+                
+                if next_prices and sig.bin_index in next_prices:
+                    # For paper trades, we'll assume we got filled at the next available MIDPOINT
+                    # plus a small penalty if we want to be conservative, 
+                    # but for now, the next midpoint is our "actual_fill_price".
+                    actual_fill = next_prices[sig.bin_index]
+                    # slippage = fill - intended (market_prob at signal time)
+                    actual_slip = actual_fill - (sig.market_prob or actual_fill)
+                    
+                    if abs(actual_slip) > 0.001:
+                        logger.info("Slippage detected on %s: Est %.4f vs Act %.4f", 
+                                    sig.market_id, sig.slippage or 0, actual_slip)
+
                 won = sig.bin_index == resolved_bin
-                pnl = _calculate_paper_pnl(sig, won)
+                pnl = _calculate_paper_pnl(sig, won, actual_fill=actual_fill)
 
                 db_result = Result(
                     signal_id=sig.id,
                     resolved_bin=resolved_bin,
                     won=won,
                     pnl_usd=pnl,
+                    actual_fill_price=actual_fill,
+                    actual_slippage=actual_slip,
                     resolved_at=resolve_time,
                 )
                 session.add(db_result)
@@ -145,12 +166,12 @@ async def _fetch_resolved_outcome(market_id: str) -> dict[str, Any] | None:
 # Scoring
 # =========================================================================
 
-def _calculate_paper_pnl(signal: Signal, won: bool) -> float:
+def _calculate_paper_pnl(signal: Signal, won: bool, actual_fill: float | None = None) -> float:
     """
-    Calculate paper P&L for a signal.
+    Calculate paper P&L for a signal, incorporating actual slippage if available.
 
     Paper bet $X at market_prob price:
-      - Win: $X * (1 / market_prob - 1) minus 2% fee
+      - Win: $X * (1 / fill_price - 1) minus 2% fee
       - Lose: -$X
     """
     bet = signal.bet_size_usd or 0.0
@@ -158,10 +179,13 @@ def _calculate_paper_pnl(signal: Signal, won: bool) -> float:
         return 0.0
 
     if won:
-        market_prob = signal.market_prob or 0.5
-        if market_prob <= 0:
-            market_prob = 0.01
-        gross_return = bet * (1.0 / market_prob - 1.0)
+        # Use actual_fill if we have it, else fallback to market_prob (0 slippage)
+        fill_price = actual_fill if actual_fill is not None else (signal.market_prob or 0.5)
+        
+        if fill_price <= 0:
+            fill_price = 0.01
+            
+        gross_return = bet * (1.0 / fill_price - 1.0)
         fee = gross_return * 0.02  # 2% fee on winnings
         return gross_return - fee
     else:
