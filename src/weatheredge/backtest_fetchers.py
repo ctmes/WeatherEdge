@@ -460,16 +460,22 @@ async def fetch_historical_forecast_ensemble(
     Falls back to single-model if only one succeeds.
     """
     import numpy as np
+    import asyncio
 
     models = models or OPEN_METEO_MODELS
     tmax_all: list[float] = []
     tmin_all: list[float] = []
     used: list[str] = []
 
-    for m in models:
-        fc = await fetch_historical_forecast(
+    tasks = [
+        fetch_historical_forecast(
             latitude, longitude, valid_date, model=m, timezone=timezone,
         )
+        for m in models
+    ]
+    results = await asyncio.gather(*tasks)
+
+    for m, fc in zip(models, results):
         if fc is not None:
             tmax_all.append(fc.tmax_mean)
             if fc.tmin_mean is not None:

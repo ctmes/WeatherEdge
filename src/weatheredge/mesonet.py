@@ -9,15 +9,44 @@ https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
+import json
+import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import httpx
 import numpy as np
 
+log = logging.getLogger("weatheredge.mesonet")
+
 IEM_BASE = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
+_CACHE_DIR = Path.home() / ".weatheredge" / "mesonet_cache"
+
+
+def _cache_key(*parts: str) -> str:
+    """Deterministic filename from key components."""
+    raw = "|".join(str(p) for p in parts)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16] + ".json"
+
+
+def _read_cache(key: str) -> list[dict[str, str]] | None:
+    path = _CACHE_DIR / key
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+    return None
+
+
+def _write_cache(key: str, data: Any) -> None:
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path = _CACHE_DIR / key
+    path.write_text(json.dumps(data, default=str), encoding="utf-8")
 
 
 # =========================================================================
@@ -124,6 +153,12 @@ async def _fetch_raw(
     data_vars: list[str],
 ) -> list[dict[str, str]]:
     """Fetch raw CSV data from IEM ASOS request endpoint."""
+    cache_k = _cache_key("iem", station_id, start_date.isoformat(), end_date.isoformat(), ",".join(data_vars))
+    cached = _read_cache(cache_k)
+    if cached is not None:
+        log.info("Loaded %d obs from cache for %s (%s to %s)", len(cached), station_id, start_date, end_date)
+        return cached
+
     params = {
         "station": station_id,
         "data": ",".join(data_vars),
@@ -151,10 +186,13 @@ async def _fetch_raw(
     # IEM returns comment lines starting with #
     lines = [l for l in text.strip().split("\n") if not l.startswith("#")]
     if len(lines) < 2:
+        _write_cache(cache_k, [])
         return []
 
     reader = csv.DictReader(lines)
-    return list(reader)
+    result = list(reader)
+    _write_cache(cache_k, result)
+    return result
 
 
 def _aggregate_to_daily(
