@@ -89,6 +89,20 @@ class TestNormaliseMarketProbs:
         assert len(normed) == 3
         assert all(math.isclose(p, 1 / 3, abs_tol=1e-6) for p in normed)
 
+    def test_probability_floor_and_cap(self):
+        # Case where one outcome is 1.0 (resolved) and others are 0.0
+        prices = [1.0, 0.0, 0.0]
+        normed = normalise_market_probs(prices)
+        # 1.0 should be capped, 0.0 should be floored
+        # Pass 1: [1.0, 0.0, 0.0]
+        # Pass 2 (floor/cap): [0.99, 0.01, 0.01] (sum=1.01)
+        # Pass 3 (renorm): [0.99/1.01, 0.01/1.01, 0.01/1.01]
+        assert normed[0] < 1.0
+        assert normed[0] > 0.95
+        assert normed[1] > 0
+        assert normed[1] < 0.01
+        assert math.isclose(sum(normed), 1.0, abs_tol=1e-6)
+
 
 # =========================================================================
 # calculate_edge

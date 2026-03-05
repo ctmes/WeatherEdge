@@ -366,8 +366,14 @@ def _process_market(
         # Apply regime + integrity multipliers
         combined_multiplier = regime_assessment.confidence_multiplier * integrity_multiplier
 
+        # -- Safety: Avoid 0% market probability bins -----------------
+        # This usually indicates a resolved market or bad data.
+        if mkt_p <= 0.001:
+            logger.debug("Skipping bin %d: market probability too low (%.4f)", i, mkt_p)
+            continue
+
         # Apply regime confidence multiplier to sizing
-        if edge >= edge_threshold:
+        if edge >= edge_threshold and combined_multiplier > 0:
             adjusted_edge = edge * combined_multiplier
             kf = kelly_fraction(adjusted_edge)
             bet = recommended_bet_usd(adjusted_edge, bankroll)

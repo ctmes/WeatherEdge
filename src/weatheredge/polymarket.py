@@ -630,7 +630,17 @@ def parse_daily_weather_event(event: dict) -> ParsedMarket | None:
     # --- Extract resolution date ---
     # Prefer endDate from the event itself for year accuracy
     resolution_date = None
-    end_date_str = event.get("endDate", "")
+    child_end = markets[0].get("endDate", "") if markets else ""
+    end_date_str = event.get("endDate", "")  # keep for ParsedMarket.end_date only
+    if child_end:   
+        try:
+            resolution_date = datetime.fromisoformat(
+                child_end.replace("Z", "+00:00")
+            ).date()
+        except (ValueError, TypeError):
+            resolution_date = _extract_date_from_title(title)
+    else:
+        resolution_date = _extract_date_from_title(title)
     if end_date_str:
         try:
             resolution_date = datetime.fromisoformat(

@@ -5,9 +5,13 @@ Kelly sizing.  Directly from godpaper Section 7.
 
 from __future__ import annotations
 
+import logging
+
 from scipy import stats
 
 from weatheredge.config import TRADING
+
+log = logging.getLogger("weatheredge.probability")
 
 
 # =========================================================================
@@ -52,11 +56,38 @@ def normalise_market_probs(prices: list[float]) -> list[float]:
     """
     Normalise market implied probabilities so they sum to 1.0.
     Polymarket prices can sum to >1 due to overround.
+
+    Includes a 1% floor and 99% cap to prevent division-by-zero or
+    infinite edges in backtesting against resolved markets.
+
+    If any input price is exactly 0.0 a WARNING is logged — this almost
+    always means PMXT orderbook enrichment failed for this market and the
+    1% result is a data artefact, not a genuine probability.
     """
     total = sum(prices)
     if total <= 0:
         return [1.0 / len(prices)] * len(prices) if prices else []
-    return [p / total for p in prices]
+
+    # 1. Primary normalization
+    normed = [p / total for p in prices]
+
+    # 2. Warn if any price is zero before flooring (indicates missing data)
+    zero_count = sum(1 for p in normed if p <= 0.0)
+    if zero_count:
+        log.warning(
+            "normalise_market_probs: %d/%d prices are 0.0 before floor is applied. "
+            "This almost certainly means PMXT orderbook enrichment failed — "
+            "check for 'No orderbook found' warnings above. "
+            "Flooring to 1%% as a safety measure; do NOT treat these as real prices.",
+            zero_count, len(normed),
+        )
+
+    # 3. Apply 1% floor and 99% cap
+    floored = [max(min(p, 0.99), 0.01) for p in normed]
+
+    # Re-normalize to ensure sum is exactly 1.0
+    final_total = sum(floored)
+    return [p / final_total for p in floored]
 
 
 # =========================================================================

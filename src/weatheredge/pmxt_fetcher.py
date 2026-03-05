@@ -162,64 +162,118 @@ def _is_weather_slug(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# ID mapping (Gamma 32-byte CID -> PMXT 20-byte truncated MID)
+# ---------------------------------------------------------------------------
+
+
+def _normalize_id(val: str | int) -> str:
+    """
+    Normalize any ID (conditionId or clobTokenId, hex or decimal)
+    to the 66-character hex format used in PMXT (0x + 64 lowercase hex).
+
+    Gamma sometimes returns token IDs as JSON-escaped strings with
+    surrounding quotes still present (e.g. '"123456"' instead of '123456').
+    We strip those before parsing.
+    """
+    if not val:
+        return ""
+
+    try:
+        if isinstance(val, str):
+            # Strip surrounding whitespace and any embedded quote characters
+            # that survive JSON double-parsing (e.g. '"123456"' → '123456')
+            val = val.strip().strip('"').strip("'")
+            if val.lower().startswith("0x"):
+                ival = int(val, 16)
+            else:
+                ival = int(val)
+        else:
+            ival = int(val)
+        # Convert to 64-char hex with 0x prefix
+        return f"0x{ival:064x}".lower()
+    except (ValueError, TypeError):
+        # Fallback for non-numeric strings (should be rare after stripping)
+        s = str(val).lower().strip('"').strip("'")
+        if not s.startswith("0x"):
+            s = "0x" + s
+        return s
+
+
+# ---------------------------------------------------------------------------
 # Fetch order book snapshots for specific market IDs
 # ---------------------------------------------------------------------------
 
 
-def fetch_orderbook_at_timestamp(
+def _extract_snapshots_from_df(
+    df: pl.DataFrame,
+    id_map: dict[str, str],
     target_ts: datetime,
-    market_ids: set[str],
 ) -> dict[str, dict]:
     """
-    Download the pmxt hourly file matching target_ts and extract the latest 
-    book_snapshot for each market_id that occurred BEFORE target_ts.
+    Filter a raw PMXT DataFrame for book_snapshot rows matching id_map keys
+    that occurred at or before target_ts, then return the latest per market.
+
+    Handles the Polars type mismatch: timestamp_received is Datetime(ms, UTC)
+    so we must compare against a proper pl.datetime literal, not a raw int.
     """
-    hour_str = target_ts.strftime("%H")
-    date_str = target_ts.date().isoformat()
-    
-    cache_k = _cache_key("orderbook_precise", date_str, hour_str,
-                         hashlib.sha256(",".join(sorted(market_ids)).encode()).hexdigest()[:8])
-    cached = _read_cache(cache_k)
-    if cached is not None:
-        result: dict[str, dict] = {}
-        for row in cached.iter_rows(named=True):
-            result[row["market_id"]] = json.loads(row["data"])
-        return result
+    normalized_ids = list(id_map.keys())
 
-    url = f"{PMXT_ARCHIVE_BASE}/polymarket_orderbook_{date_str}T{hour_str}.parquet"
-    log.info("Fetching precise pmxt orderbook for %s ...", target_ts.isoformat())
-
-    try:
-        df = _download_parquet(url)
-    except Exception as e:
-        log.warning("Failed to fetch %s: %s", url, e)
-        return {}
-
-    if df.is_empty():
-        return {}
-
-    # Filter for our market IDs, book_snapshot events, and timestamp <= target_ts
-    # pmxt timestamps are usually in milliseconds or microseconds. 
-    # We'll assume the df 'timestamp_received' is what we filter on.
+    # --- timestamp filter -------------------------------------------------
+    # timestamp_received dtype: Datetime(time_unit='ms', time_zone='UTC')
+    # Comparing against a raw Python int silently produces wrong results in
+    # Polars because it treats the int as microseconds/ticks, not epoch-ms.
+    # Cast the column to Int64 (epoch-ms) first so the comparison is correct.
+    ts_col = pl.col("timestamp_received").cast(pl.Int64)
     target_ms = int(target_ts.timestamp() * 1000)
-    
+
     filtered = df.filter(
-        pl.col("market_id").is_in(list(market_ids))
+        pl.col("market_id").is_in(normalized_ids)
         & (pl.col("update_type") == "book_snapshot")
-        & (pl.col("timestamp_received") <= target_ms)
+        & (ts_col <= target_ms)
+    )
+
+    log.info(
+        "Snapshot filter: %d IDs, target_ms=%d → %d rows matched",
+        len(normalized_ids), target_ms, len(filtered),
     )
 
     if filtered.is_empty():
-        return {}
+        # Check if IDs exist but all snapshots are AFTER the target timestamp.
+        # This happens when target_ms is before the PMXT archive started for
+        # that day (e.g. decision at 06:51 UTC but archive starts at 12:53 UTC).
+        # In that case, use the EARLIEST available snapshot as the best proxy —
+        # it's still a real pre-resolution market price.
+        id_only = df.filter(
+            pl.col("market_id").is_in(normalized_ids)
+            & (pl.col("update_type") == "book_snapshot")
+        )
+        if not id_only.is_empty():
+            earliest_ms = id_only.select(ts_col.alias("ts")).get_column("ts").min()
+            lag_minutes = (earliest_ms - target_ms) / 60_000
+            log.warning(
+                "target_ms=%d is %.0f min BEFORE the earliest snapshot (epoch-ms=%d). "
+                "PMXT archive didn't exist yet at decision time. "
+                "Using earliest available snapshot as price proxy.",
+                target_ms, lag_minutes, earliest_ms,
+            )
+            # Use earliest snapshot per market instead (sort ascending)
+            filtered = id_only.sort(ts_col, descending=False)
+        else:
+            log.warning(
+                "No book_snapshot rows found for any of the %d market IDs. "
+                "Sample normalized IDs: %s",
+                len(normalized_ids), normalized_ids[:3],
+            )
+            return {}
 
-    # Take the latest snapshot per market
-    filtered = filtered.sort("timestamp_received", descending=True)
+    # Take the latest snapshot per market (sort descending, first-seen wins)
+    filtered = filtered.sort(ts_col, descending=True)
 
     result: dict[str, dict] = {}
     seen: set[str] = set()
-
     for row in filtered.iter_rows(named=True):
-        mid = row["market_id"]
+        tmid = row["market_id"]
+        mid = id_map.get(tmid, tmid)
         if mid in seen:
             continue
         seen.add(mid)
@@ -229,11 +283,113 @@ def fetch_orderbook_at_timestamp(
         except (json.JSONDecodeError, TypeError):
             continue
 
-    # Cache the filtered result
-    if result:
-        cache_rows = [{"market_id": mid, "data": json.dumps(d)} for mid, d in result.items()]
-        cache_df = pl.DataFrame(cache_rows)
-        _write_cache(cache_k, cache_df)
+    return result
+
+
+def fetch_orderbook_at_timestamp(
+    target_ts: datetime,
+    market_ids: set[str],
+) -> dict[str, dict]:
+    """
+    Download the pmxt hourly file(s) matching target_ts and extract the latest
+    book_snapshot for each market_id that occurred at or before target_ts.
+
+    Tries the exact target hour first, then the previous hour as a fallback
+    (useful when the model decision time falls early in an hour and the most
+    recent snapshot is in the prior file).
+    """
+    date_str = target_ts.date().isoformat()
+    hour = target_ts.hour
+
+    # Cache key now includes the full market_ids set so changing the set
+    # (e.g. adding condition_ids) busts any stale cached empty results.
+    ids_hash = hashlib.sha256(",".join(sorted(market_ids)).encode()).hexdigest()[:12]
+    cache_k = _cache_key("orderbook_v2", date_str, str(hour), ids_hash)
+
+    cached = _read_cache(cache_k)
+    if cached is not None:
+        # A cached DataFrame with 0 rows means a previously confirmed empty
+        # result — return {} without re-downloading.
+        if cached.is_empty():
+            return {}
+        result: dict[str, dict] = {}
+        for row in cached.iter_rows(named=True):
+            result[row["market_id"]] = json.loads(row["data"])
+        log.debug("Cache hit: %d orderbooks for %s hour=%02d", len(result), date_str, hour)
+        return result
+
+    id_map = {_normalize_id(mid): mid for mid in market_ids}
+
+    # Bail out immediately for future dates — PMXT only archives past data.
+    today = datetime.utcnow().date()
+    if target_ts.date() > today:
+        log.debug("Skipping PMXT fetch for future date %s (today=%s)", date_str, today)
+        return {}
+
+    # Try target hour first, then scan forward to find the first file with data.
+    # PMXT archive typically starts mid-day (~12:00 UTC); early-hour targets
+    # (e.g. 06:51 from ECMWF 00Z run) won't have data in hours 5-6.
+    # We scan from max(hour, 10) forward so we skip known-empty early files.
+    start_hour = max(hour, 10)
+    hours_to_try = list(range(start_hour, 24))
+    if hour < start_hour:
+        # Original target was before our start — prepend it so it's tried first
+        # (in case PMXT does have data for that specific hour on some days)
+        hours_to_try = [hour] + hours_to_try
+
+    result: dict[str, dict] = {}
+    got_404_on_reliable_hour = False
+    for h in hours_to_try:
+        if got_404_on_reliable_hour:
+            break
+        url = f"{PMXT_ARCHIVE_BASE}/polymarket_orderbook_{date_str}T{h:02d}.parquet"
+        log.info("Fetching pmxt orderbook: %s (hour=%02d)", date_str, h)
+        try:
+            df = _download_parquet(url)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404 and h >= 12:
+                # A 404 on a mid-day-or-later hour means no archive for this
+                # date at all — no point trying subsequent hours.
+                log.warning(
+                    "404 on hour=%02d for %s — no PMXT data for this date, stopping scan.",
+                    h, date_str,
+                )
+                got_404_on_reliable_hour = True
+            else:
+                log.warning("Failed to fetch %s: %s", url, e)
+            continue
+        except Exception as e:
+            log.warning("Failed to fetch %s: %s", url, e)
+            continue
+
+        if df.is_empty():
+            continue
+
+        result = _extract_snapshots_from_df(df, id_map, target_ts)
+        if result:
+            log.info(
+                "Found %d/%d orderbooks in hour=%02d file for %s",
+                len(result), len(market_ids), h, date_str,
+            )
+            break
+        else:
+            log.debug("Hour=%02d had no matching snapshots, trying previous hour", h)
+
+    # Cache the result (including empty — to avoid re-downloading on repeated runs)
+    cache_rows = [{"market_id": mid, "data": json.dumps(d)} for mid, d in result.items()]
+    cache_df = pl.DataFrame(
+        cache_rows if cache_rows else {"market_id": pl.Series([], dtype=pl.Utf8),
+                                       "data":      pl.Series([], dtype=pl.Utf8)}
+    )
+    _write_cache(cache_k, cache_df)
+
+    if not result:
+        log.warning(
+            "No orderbook data found for %s (target=%s, tried hours %s). "
+            "Markets will fall back to Gamma post-resolution prices → 1%% floor.",
+            date_str, target_ts.isoformat(), hours_to_try,
+        )
+
     return result
 
 
@@ -275,9 +431,13 @@ def fetch_orderbook_for_markets(
     if df.is_empty():
         return {}
 
+    # PMXT Parquet market_id is a 32-byte hex ID.
+    id_map = {_normalize_id(mid): mid for mid in market_ids}
+    normalized_ids = list(id_map.keys())
+
     # Filter for our market IDs and book_snapshot events
     filtered = df.filter(
-        pl.col("market_id").is_in(list(market_ids))
+        pl.col("market_id").is_in(normalized_ids)
         & (pl.col("update_type") == "book_snapshot")
     )
 
@@ -293,7 +453,9 @@ def fetch_orderbook_for_markets(
     seen: set[str] = set()
 
     for row in filtered.iter_rows(named=True):
-        mid = row["market_id"]
+        tmid = row["market_id"]
+        # Map back to the original full ID
+        mid = id_map.get(tmid, tmid)
         if mid in seen:
             continue
         seen.add(mid)
@@ -362,13 +524,12 @@ def enrich_market_with_orderbook(
                 "Multi-outcome enrichment: set %d/%d bin prices from order book",
                 enriched_count, len(parsed.outcome_prices),
             )
+        else:
+            log.warning("No orderbook data found for multi-outcome event. Using Gamma prices as fallback.")
         return parsed
 
-    # Binary market path (original logic)
-    if len(parsed.outcome_prices) == 2:
-        parsed.outcome_prices = [0.0, 0.0]
-
     if orderbook is None:
+        log.debug("No orderbook provided for binary market enrichment. Keeping existing prices.")
         return parsed
 
     best_bid = float(orderbook.get("best_bid") or 0)
@@ -441,26 +602,39 @@ async def fetch_pmxt_resolved_markets(
     if not all_pairs:
         return []
 
-    # Step 2: collect all market IDs we need order book data for
-    # For multi-outcome (daily events), we need child token IDs, not parent event ID
+    # Step 2: collect all market IDs we need order book data for.
+    #
+    # PMXT indexes order books by Polymarket conditionId (hex, 66 chars).
+    #
+    # For BINARY markets: parsed.condition_id is the hex conditionId -> add it.
+    #
+    # For MULTI-OUTCOME daily events: parsed.condition_id is the INTEGER Gamma
+    # event ID (e.g. "218765") which is never in PMXT.  The actual tradeable
+    # conditionIds live on each child market inside raw["markets"][i]["conditionId"].
+    # We must extract and add those instead.
     market_id_set: set[str] = set()
-    # Map: token_id -> (parsed_market_index, bin_index)
-    token_to_bin: dict[str, tuple[int, int]] = {}
-
     for idx, (parsed, raw) in enumerate(all_pairs):
-        if "markets" in raw and len(raw["markets"]) > 0:
-            # Multi-outcome daily event: PMXT indexes by child condition_id
-            sorted_markets = sorted(raw["markets"], key=lambda m: int(m.get("groupItemThreshold", "0")))
-            for bin_idx, m_raw in enumerate(sorted_markets):
-                cid = m_raw.get("conditionId", m_raw.get("id"))
+        child_markets = raw.get("markets", [])
+        if child_markets:
+            # Multi-outcome: add each child market's conditionId
+            for child in child_markets:
+                cid = child.get("conditionId") or child.get("condition_id") or ""
                 if cid:
-                    market_id_set.add(cid)
-                    token_to_bin[cid] = (idx, bin_idx)
+                    market_id_set.add(str(cid))
         else:
-            # Binary or fallback: condition_id
+            # Binary: parsed.condition_id is the real hex conditionId
             cid = parsed.condition_id
             if cid:
                 market_id_set.add(cid)
+        # Also add token IDs for forward-compat (currently don't match PMXT)
+        for tid in parsed.token_ids:
+            market_id_set.add(tid)
+
+    log.info(
+        "Step 2: collected %d unique market IDs for PMXT lookup "
+        "(%d pairs, child conditionIds + binary conditionIds + token IDs)",
+        len(market_id_set), len(all_pairs),
+    )
 
     # Step 3: for each day in the range, fetch order book snapshots
     loop = asyncio.get_event_loop()
@@ -504,36 +678,66 @@ async def fetch_pmxt_resolved_markets(
 
     for idx, (parsed, raw) in enumerate(all_pairs):
         if "markets" in raw and len(raw["markets"]) > 0:
-            # Multi-outcome: build per-bin orderbook dict using condition_id
-            sorted_markets = sorted(raw["markets"], key=lambda m: int(m.get("groupItemThreshold", "0")))
+            # Multi-outcome: look up each bin by the CHILD market's conditionId.
+            # parsed.condition_id is the INTEGER Gamma event ID (e.g. "218765")
+            # which is never in PMXT. The child hex conditionIds are the real keys.
+            sorted_markets = sorted(
+                raw["markets"], key=lambda m: int(m.get("groupItemThreshold", "0"))
+            )
             per_bin_obs: dict[int, dict] = {}
             pmxt_obs: dict[str, dict] = {}
-            
-            for bin_idx, m_raw in enumerate(sorted_markets):
-                cid = m_raw.get("conditionId", m_raw.get("id"))
-                if cid and cid in all_orderbooks:
-                    per_bin_obs[bin_idx] = all_orderbooks[cid]
-                    # Map the found orderbook to the correct token_id for the pipeline
-                    if bin_idx < len(parsed.token_ids):
-                        pmxt_obs[parsed.token_ids[bin_idx]] = all_orderbooks[cid]
-            
+
+            for bin_idx, child in enumerate(sorted_markets):
+                child_cid = str(child.get("conditionId") or child.get("condition_id") or "")
+                ob = all_orderbooks.get(child_cid) if child_cid else None
+                # Fallback to token ID if child conditionId didn't match
+                if not ob and bin_idx < len(parsed.token_ids):
+                    ob = all_orderbooks.get(parsed.token_ids[bin_idx])
+                if ob:
+                    per_bin_obs[bin_idx] = ob
+                    pmxt_obs[child_cid] = ob
+
             if per_bin_obs:
                 parsed = enrich_market_with_orderbook(
                     parsed, per_bin_orderbooks=per_bin_obs
                 )
                 enriched_count += 1
                 raw["_pmxt_orderbook"] = pmxt_obs
+                log.debug(
+                    "Multi-outcome %s: enriched %d/%d bins via child conditionIds",
+                    parsed.question, len(per_bin_obs), len(sorted_markets),
+                )
+            else:
+                log.warning(
+                    "No orderbook found for multi-outcome event condition_id=%s (%s). "
+                    "Child conditionIds tried: %s. "
+                    "Prices will be 0.0 -> floored to 1%% by normalisation.",
+                    parsed.condition_id, parsed.question,
+                    [str(m.get("conditionId", "?"))[:16] for m in sorted_markets[:3]],
+                )
         else:
-            # Binary market: lookup using condition_id 
-            cid = parsed.condition_id
-            ob = all_orderbooks.get(cid)
+            # Binary market: conditionId is the PMXT primary key (confirmed by probe).
+            # Try it first, then fall back to token IDs for forward-compat.
+            ob = all_orderbooks.get(parsed.condition_id)
+
+            if not ob:
+                for tid in parsed.token_ids:
+                    if tid in all_orderbooks:
+                        ob = all_orderbooks[tid]
+                        log.debug("Binary market matched via token_id %s (not condition_id)", tid)
+                        break
 
             if ob:
                 parsed = enrich_market_with_orderbook(parsed, orderbook=ob)
                 enriched_count += 1
                 raw["_pmxt_orderbook"] = ob
             else:
-                log.warning("No orderbook found for binary market %s on date. Prices will be 0.0", cid)
+                log.warning(
+                    "No orderbook found for market condition_id=%s (%s). "
+                    "Prices will be 0.0 → floored to 1%% by normalisation. "
+                    "Check that this conditionId appears in the PMXT file for this date.",
+                    parsed.condition_id, parsed.question,
+                )
 
         enriched_pairs.append((parsed, raw))
 

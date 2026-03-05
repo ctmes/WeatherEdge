@@ -11,4 +11,8 @@ venv/
 .pytest_cache/
 logs/
 data/
+weather_tick_data/
+*.log
+*.txt
+results.csv
 scripts/__pycache__/

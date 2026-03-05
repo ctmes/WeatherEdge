@@ -67,89 +67,77 @@ async def fetch_resolved_markets(
 ) -> list[tuple[ParsedMarket, dict]]:
     """
     Fetch resolved weather markets from Gamma ``GET /markets``.
-
-    Returns ``(ParsedMarket, raw_dict)`` pairs.  The raw dict is kept so
-    the caller can extract ``resolved_outcome`` and other metadata that
-    doesn't survive the ParsedMarket conversion.
+    Uses per-day caching to avoid redundant fetches for overlapping ranges.
     """
-    cache_k = _cache_key("gamma_resolved", start.isoformat(), end.isoformat())
-    cached = _read_cache(cache_k)
-    if cached is not None:
-        log.info("Loaded %d resolved markets from cache", len(cached))
-        result: list[tuple[ParsedMarket, dict]] = []
-        for raw_item in cached:
-            parsed = _raw_to_parsed_market(raw_item)
-            if parsed is not None:
-                result.append((parsed, raw_item))
-        return result
-
-    all_raw: list[dict] = []
-    offset = 0
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        for _ in range(max_pages):
-            url = f"{POLYMARKET_GAMMA_BASE}/markets"
-            params = {
-                "limit": page_size,
-                "offset": offset,
-                "closed": "true",
-                "active": "false",
-                "end_date_min": start.isoformat() + "T00:00:00Z",
-                "end_date_max": end.isoformat() + "T23:59:59Z",
-            }
-            import asyncio
-            for attempt in range(3):
+    from tqdm.asyncio import tqdm
+    all_pairs: list[tuple[ParsedMarket, dict]] = []
+    
+    current = start
+    pbar = tqdm(total=(end - start).days + 1, desc="Gamma Markets", unit="day", leave=False)
+    
+    while current <= end:
+        date_str = current.isoformat()
+        cache_k = _cache_key("gamma_res_m", date_str)
+        cached = _read_cache(cache_k)
+        
+        if cached is not None:
+            day_raw = cached
+        else:
+            day_raw = []
+            async with httpx.AsyncClient(timeout=30) as client:
+                # Fetch first page to see if we need more
+                url = f"{POLYMARKET_GAMMA_BASE}/markets"
+                params = {
+                    "limit": page_size,
+                    "offset": 0,
+                    "closed": "true",
+                    "active": "false",
+                    "end_date_min": f"{date_str}T00:00:00Z",
+                    "end_date_max": f"{date_str}T23:59:59Z",
+                }
+                
                 try:
                     resp = await client.get(url, params=params)
                     resp.raise_for_status()
                     data = resp.json()
-                    break
+                    if data:
+                        for item in data:
+                            if _is_weather_market(item):
+                                day_raw.append(item)
+                        
+                        # If first page was full, speculatively fetch more pages in parallel
+                        if len(data) >= page_size:
+                            # Fetch up to 10 more pages (offsets 100, 200, ..., 1000)
+                            offsets = [page_size * i for i in range(1, 11)]
+                            tasks = []
+                            for offset in offsets:
+                                p = params.copy()
+                                p["offset"] = offset
+                                tasks.append(client.get(url, params=p))
+                            
+                            responses = await asyncio.gather(*tasks, return_exceptions=True)
+                            for r in responses:
+                                if isinstance(r, httpx.Response):
+                                    r_data = r.json()
+                                    if not r_data: continue
+                                    for item in r_data:
+                                        if _is_weather_market(item):
+                                            day_raw.append(item)
                 except Exception as e:
-                    if attempt < 2:
-                        log.warning("Gamma fetch warn (offset=%d, attempt=%d): %s", offset, attempt, e)
-                        await asyncio.sleep(2 ** attempt)
-                    else:
-                        log.warning("Gamma fetch failed (offset=%d): %s", offset, e)
-                        data = None
+                    log.warning("Gamma fetch failed for %s: %s", date_str, e)
             
-            if data is None:
-                break
-
-            if not data:
-                break
-
-            for item in data:
-                if _is_weather_market(item):
-                    # Reject global climate anomaly markets (not city-level)
-                    parsed_check = _raw_to_parsed_market(item)
-                    if parsed_check and parsed_check.station_id == "GLOBAL":
-                        continue
-                    # Filter by resolution date within our window
-                    end_date_str = item.get("endDate", "")
-                    if end_date_str:
-                        try:
-                            market_end = datetime.fromisoformat(
-                                end_date_str.replace("Z", "+00:00")
-                            ).date()
-                            if start <= market_end <= end:
-                                all_raw.append(item)
-                        except (ValueError, TypeError):
-                            pass
-
-            if len(data) < page_size:
-                break
-            offset += page_size
-
-    # Cache the full raw response for deterministic reruns
-    _write_cache(cache_k, all_raw)
-    log.info("Fetched %d resolved weather markets from Gamma", len(all_raw))
-
-    result = []
-    for raw_item in all_raw:
-        parsed = _raw_to_parsed_market(raw_item)
-        if parsed is not None:
-            result.append((parsed, raw_item))
-    return result
+            _write_cache(cache_k, day_raw)
+            
+        for raw_item in day_raw:
+            parsed = _raw_to_parsed_market(raw_item)
+            if parsed:
+                all_pairs.append((parsed, raw_item))
+        
+        current += timedelta(days=1)
+        pbar.update(1)
+        
+    pbar.close()
+    return all_pairs
 
 
 # =========================================================================
@@ -160,95 +148,80 @@ async def fetch_resolved_daily_events(
     start: date,
     end: date,
     *,
-    max_pages: int = 500,
+    max_pages: int = 100,
     page_size: int = 100,
 ) -> list[tuple[ParsedMarket, dict]]:
     """
     Fetch resolved daily weather events from Gamma ``GET /events``.
-
-    Daily weather markets are structured as events with child markets
-    (one per temperature bin). This function fetches the parent events,
-    filters for daily weather markets, and parses them into ParsedMarket
-    objects with complete bin sets.
-
-    Returns ``(ParsedMarket, raw_event_dict)`` pairs.
+    Uses per-day caching to avoid redundant fetches for overlapping ranges.
     """
-    cache_k = _cache_key("gamma_daily_events", start.isoformat(), end.isoformat())
-    cached = _read_cache(cache_k)
-    if cached is not None:
-        log.info("Loaded %d daily weather events from cache", len(cached))
-        result: list[tuple[ParsedMarket, dict]] = []
-        for raw_event in cached:
-            parsed = parse_daily_weather_event(raw_event)
-            if parsed is not None:
-                result.append((parsed, raw_event))
-        return result
-
-    all_raw: list[dict] = []
-    offset = 0
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        for _ in range(max_pages):
-            url = f"{POLYMARKET_GAMMA_BASE}/events"
-            params = {
-                "limit": page_size,
-                "offset": offset,
-                "closed": "true",
-                "end_date_min": start.isoformat() + "T00:00:00Z",
-                "end_date_max": end.isoformat() + "T23:59:59Z",
-            }
-            import asyncio
-            for attempt in range(3):
+    from tqdm.asyncio import tqdm
+    all_pairs: list[tuple[ParsedMarket, dict]] = []
+    
+    current = start
+    pbar = tqdm(total=(end - start).days + 1, desc="Gamma Events ", unit="day", leave=False)
+    
+    while current <= end:
+        date_str = current.isoformat()
+        cache_k = _cache_key("gamma_daily_e", date_str)
+        cached = _read_cache(cache_k)
+        
+        if cached is not None:
+            day_raw = cached
+        else:
+            day_raw = []
+            async with httpx.AsyncClient(timeout=30) as client:
+                url = f"{POLYMARKET_GAMMA_BASE}/events"
+                params = {
+                    "limit": page_size,
+                    "offset": 0,
+                    "closed": "true",
+                    "end_date_min": f"{date_str}T00:00:00Z",
+                    "end_date_max": f"{date_str}T23:59:59Z",
+                }
+                
                 try:
                     resp = await client.get(url, params=params)
                     resp.raise_for_status()
                     data = resp.json()
-                    break
+                    if data:
+                        for event in data:
+                            title = event.get("title", "").lower()
+                            if "highest temperature in" in title or "temperature" in title:
+                                day_raw.append(event)
+                        
+                        if len(data) >= page_size:
+                            offsets = [page_size * i for i in range(1, 11)]
+                            tasks = []
+                            for offset in offsets:
+                                p = params.copy()
+                                p["offset"] = offset
+                                tasks.append(client.get(url, params=p))
+                                
+                            responses = await asyncio.gather(*tasks, return_exceptions=True)
+                            for r in responses:
+                                if isinstance(r, httpx.Response):
+                                    r_data = r.json()
+                                    if not r_data: continue
+                                    for event in r_data:
+                                        title = event.get("title", "").lower()
+                                        if "highest temperature in" in title or "temperature" in title:
+                                            day_raw.append(event)
                 except Exception as e:
-                    if attempt < 2:
-                        log.warning("Gamma event fetch warn (offset=%d, attempt=%d): %s", offset, attempt, e)
-                        await asyncio.sleep(2 ** attempt)
-                    else:
-                        log.warning("Gamma event fetch failed (offset=%d): %s", offset, e)
-                        data = None
+                    log.warning("Gamma fetch failed for %s: %s", date_str, e)
+
+            _write_cache(cache_k, day_raw)
             
-            if data is None:
-                break
-
-            if not data:
-                break
-
-            for event in data:
-                title = event.get("title", "").lower()
-                if "highest temperature in" not in title:
-                    continue
-
-                # Filter by end date within our window
-                end_date_str = event.get("endDate", "")
-                if end_date_str:
-                    try:
-                        event_end = datetime.fromisoformat(
-                            end_date_str.replace("Z", "+00:00")
-                        ).date()
-                        if start <= event_end <= end:
-                            all_raw.append(event)
-                    except (ValueError, TypeError):
-                        pass
-
-            if len(data) < page_size:
-                break
-            offset += page_size
-
-    # Cache for deterministic reruns
-    _write_cache(cache_k, all_raw)
-    log.info("Fetched %d resolved daily weather events from Gamma", len(all_raw))
-
-    result = []
-    for raw_event in all_raw:
-        parsed = parse_daily_weather_event(raw_event)
-        if parsed is not None:
-            result.append((parsed, raw_event))
-    return result
+        for raw_event in day_raw:
+            parsed = parse_daily_weather_event(raw_event)
+            if parsed:
+                all_pairs.append((parsed, raw_event))
+        
+        current += timedelta(days=1)
+        pbar.update(1)
+        
+    pbar.close()
+    return all_pairs
 
 
 def extract_winner_from_event(raw_event: dict) -> int | None:
