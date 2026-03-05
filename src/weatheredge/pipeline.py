@@ -357,6 +357,11 @@ def _process_market(
                 if book:
                     integrity = check_midpoint_integrity(book.get("bids"), book.get("asks"))
                     integrity_multiplier = integrity["multiplier"]
+                else:
+                    integrity_multiplier = 0.0
+            else:
+                # No orderbook for this bin = no liquidity
+                integrity_multiplier = 0.0
 
         # Apply regime + integrity multipliers
         combined_multiplier = regime_assessment.confidence_multiplier * integrity_multiplier
@@ -383,7 +388,7 @@ def _process_market(
                 # Edge evaporated once we accounted for realistic slippage
                 continue
 
-            adjusted_edge = refined_edge * regime_assessment.confidence_multiplier
+            adjusted_edge = refined_edge * combined_multiplier
             kf = kelly_fraction(adjusted_edge)
             bet = recommended_bet_usd(adjusted_edge, bankroll)
             if bet > bankroll * 0.03:

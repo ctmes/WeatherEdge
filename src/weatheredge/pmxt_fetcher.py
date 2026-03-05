@@ -330,9 +330,11 @@ def enrich_market_with_orderbook(
     """
     if per_bin_orderbooks and len(parsed.outcome_prices) > 2:
         # Multi-outcome: set each bin's price from its own order book
+        original_prices = len(parsed.outcome_prices)
+        new_prices = [0.0] * original_prices
         enriched_count = 0
         for bin_idx, ob in per_bin_orderbooks.items():
-            if bin_idx >= len(parsed.outcome_prices):
+            if bin_idx >= original_prices:
                 continue
             best_bid = float(ob.get("best_bid") or 0)
             best_ask = float(ob.get("best_ask") or 0)
@@ -349,11 +351,12 @@ def enrich_market_with_orderbook(
             # The midpoint from the YES side of the child market
             side = ob.get("side", "YES")
             if side == "YES":
-                parsed.outcome_prices[bin_idx] = midpoint
+                new_prices[bin_idx] = midpoint
             else:
-                parsed.outcome_prices[bin_idx] = 1.0 - midpoint
+                new_prices[bin_idx] = 1.0 - midpoint
             enriched_count += 1
 
+        parsed.outcome_prices = new_prices
         if enriched_count > 0:
             log.info(
                 "Multi-outcome enrichment: set %d/%d bin prices from order book",
@@ -362,6 +365,9 @@ def enrich_market_with_orderbook(
         return parsed
 
     # Binary market path (original logic)
+    if len(parsed.outcome_prices) == 2:
+        parsed.outcome_prices = [0.0, 0.0]
+
     if orderbook is None:
         return parsed
 
@@ -442,15 +448,19 @@ async def fetch_pmxt_resolved_markets(
     token_to_bin: dict[str, tuple[int, int]] = {}
 
     for idx, (parsed, raw) in enumerate(all_pairs):
-        if len(parsed.token_ids) > 0 and len(parsed.outcome_prices) > 2:
-            # Multi-outcome: each token_id maps to a bin
-            for bin_idx, tid in enumerate(parsed.token_ids):
-                if tid:
-                    market_id_set.add(tid)
-                    token_to_bin[tid] = (idx, bin_idx)
+        if "markets" in raw and len(raw["markets"]) > 0:
+            # Multi-outcome daily event: PMXT indexes by child condition_id
+            sorted_markets = sorted(raw["markets"], key=lambda m: int(m.get("groupItemThreshold", "0")))
+            for bin_idx, m_raw in enumerate(sorted_markets):
+                cid = m_raw.get("conditionId", m_raw.get("id"))
+                if cid:
+                    market_id_set.add(cid)
+                    token_to_bin[cid] = (idx, bin_idx)
         else:
-            # Binary or fallback: use condition_id
-            market_id_set.add(parsed.condition_id)
+            # Binary or fallback: condition_id
+            cid = parsed.condition_id
+            if cid:
+                market_id_set.add(cid)
 
     # Step 3: for each day in the range, fetch order book snapshots
     loop = asyncio.get_event_loop()
@@ -493,27 +503,37 @@ async def fetch_pmxt_resolved_markets(
     enriched_count = 0
 
     for idx, (parsed, raw) in enumerate(all_pairs):
-        if len(parsed.token_ids) > 0 and len(parsed.outcome_prices) > 2:
-            # Multi-outcome: build per-bin orderbook dict
+        if "markets" in raw and len(raw["markets"]) > 0:
+            # Multi-outcome: build per-bin orderbook dict using condition_id
+            sorted_markets = sorted(raw["markets"], key=lambda m: int(m.get("groupItemThreshold", "0")))
             per_bin_obs: dict[int, dict] = {}
-            for bin_idx, tid in enumerate(parsed.token_ids):
-                if tid and tid in all_orderbooks:
-                    per_bin_obs[bin_idx] = all_orderbooks[tid]
+            pmxt_obs: dict[str, dict] = {}
+            
+            for bin_idx, m_raw in enumerate(sorted_markets):
+                cid = m_raw.get("conditionId", m_raw.get("id"))
+                if cid and cid in all_orderbooks:
+                    per_bin_obs[bin_idx] = all_orderbooks[cid]
+                    # Map the found orderbook to the correct token_id for the pipeline
+                    if bin_idx < len(parsed.token_ids):
+                        pmxt_obs[parsed.token_ids[bin_idx]] = all_orderbooks[cid]
+            
             if per_bin_obs:
                 parsed = enrich_market_with_orderbook(
                     parsed, per_bin_orderbooks=per_bin_obs
                 )
                 enriched_count += 1
-                raw["_pmxt_orderbook"] = {
-                    tid: all_orderbooks[tid] for tid in parsed.token_ids if tid in all_orderbooks
-                }
+                raw["_pmxt_orderbook"] = pmxt_obs
         else:
-            # Binary market: use condition_id lookup
-            ob = all_orderbooks.get(parsed.condition_id)
+            # Binary market: lookup using condition_id 
+            cid = parsed.condition_id
+            ob = all_orderbooks.get(cid)
+
             if ob:
                 parsed = enrich_market_with_orderbook(parsed, orderbook=ob)
                 enriched_count += 1
                 raw["_pmxt_orderbook"] = ob
+            else:
+                log.warning("No orderbook found for binary market %s on date. Prices will be 0.0", cid)
 
         enriched_pairs.append((parsed, raw))
 

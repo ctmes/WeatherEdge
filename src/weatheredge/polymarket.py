@@ -10,10 +10,12 @@ import re
 from datetime import date, datetime
 from typing import Any
 
+import logging
 import httpx
 
 log = logging.getLogger("weatheredge.polymarket")
 
+from weatheredge.cache import cache_key as _cache_key, read_cache, write_cache
 from weatheredge.config import (
     POLYMARKET_CLOB_BASE,
     POLYMARKET_GAMMA_BASE,
@@ -21,6 +23,8 @@ from weatheredge.config import (
     WEATHER_KEYWORDS,
 )
 from weatheredge.models import ParsedMarket
+
+_SUBDIR = "polymarket_cache"
 
 # Additional keywords for global climate anomaly markets
 CLIMATE_KEYWORDS = ["temperature increase", "hottest on record", "hottest month", "hottest year"]
@@ -71,15 +75,22 @@ async def fetch_weather_markets(
     offset = 0
 
     for _ in range(max_pages):
-        url = f"{POLYMARKET_GAMMA_BASE}/markets"
-        params = {
-            "limit": page_size,
-            "offset": offset,
-            "active": "true",
-            "closed": "false",
-        }
+        ck = _cache_key("markets", str(offset), str(page_size))
+        cached = read_cache(_SUBDIR, ck, max_age_hours=5/60)  # 5 min TTL
+        if cached is not None:
+            data = cached
+        else:
+            url = f"{POLYMARKET_GAMMA_BASE}/markets"
+            params = {
+                "limit": page_size,
+                "offset": offset,
+                "active": "true",
+                "closed": "false",
+            }
+            data = await _get_json(url, params)
+            if data:
+                write_cache(_SUBDIR, ck, data)
 
-        data = await _get_json(url, params)
         if not data:
             break
 
@@ -115,19 +126,26 @@ async def fetch_weather_events(
     offset = 0
 
     for _ in range(max_pages):
-        url = f"{POLYMARKET_GAMMA_BASE}/events"
-        params = {
-            "limit": page_size,
-            "offset": offset,
-            "active": "true",
-            "closed": "false",
-        }
+        ck = _cache_key("events", str(offset), str(page_size))
+        cached = read_cache(_SUBDIR, ck, max_age_hours=5/60)  # 5 min TTL
+        if cached is not None:
+            data = cached
+        else:
+            url = f"{POLYMARKET_GAMMA_BASE}/events"
+            params = {
+                "limit": page_size,
+                "offset": offset,
+                "active": "true",
+                "closed": "false",
+            }
 
-        try:
-            data = await _get_json(url, params)
-        except Exception as e:
-            log.warning("Gamma /events fetch failed (offset=%d): %s", offset, e)
-            break
+            try:
+                data = await _get_json(url, params)
+                if data:
+                    write_cache(_SUBDIR, ck, data)
+            except Exception as e:
+                log.warning("Gamma /events fetch failed (offset=%d): %s", offset, e)
+                break
 
         if not data:
             break
@@ -475,13 +493,22 @@ async def fetch_midpoint_prices(token_ids: list[str]) -> dict[str, float]:
     """
     if not token_ids:
         return {}
+        
+    sorted_ids = sorted(token_ids)
+    ck = _cache_key("midpoints", *sorted_ids)
+    cached = read_cache(_SUBDIR, ck, max_age_hours=2/60)  # 2 min TTL
+    if cached is not None:
+        return cached
 
     url = f"{POLYMARKET_CLOB_BASE}/midpoints"
     params = {"token_ids": ",".join(token_ids)}
 
     try:
         data = await _get_json(url, params)
-        return {k: float(v) for k, v in data.items()} if isinstance(data, dict) else {}
+        result = {k: float(v) for k, v in data.items()} if isinstance(data, dict) else {}
+        if result:
+            write_cache(_SUBDIR, ck, result)
+        return result
     except Exception:
         return {}
 

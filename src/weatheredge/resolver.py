@@ -12,12 +12,14 @@ from typing import Any
 import httpx
 from sqlalchemy import select, func
 
+from weatheredge.cache import cache_key as _cache_key, read_cache, write_cache
 from weatheredge.config import POLYMARKET_GAMMA_BASE
 from weatheredge.db import get_session, get_next_market_price
 from weatheredge.models import BrierScore, Market, Result, Signal
 from weatheredge.probability import brier_score
 
 logger = logging.getLogger("weatheredge.resolver")
+_SUBDIR = "resolver_cache"
 
 
 # =========================================================================
@@ -123,6 +125,11 @@ async def _fetch_resolved_outcome(market_id: str) -> dict[str, Any] | None:
 
     Returns {"resolved_bin": int} if the market is resolved, else None.
     """
+    ck = _cache_key("resolved", market_id)
+    cached = read_cache(_SUBDIR, ck)  # Permanent cache for resolutions
+    if cached is not None:
+        return cached
+
     url = f"{POLYMARKET_GAMMA_BASE}/markets/{market_id}"
 
     async with httpx.AsyncClient(timeout=15) as client:
@@ -159,7 +166,9 @@ async def _fetch_resolved_outcome(market_id: str) -> dict[str, Any] | None:
         logger.debug("Market %s is closed but no clear winning outcome.", market_id)
         return None
 
-    return {"resolved_bin": resolved_bin}
+    result = {"resolved_bin": resolved_bin}
+    write_cache(_SUBDIR, ck, result)
+    return result
 
 
 # =========================================================================

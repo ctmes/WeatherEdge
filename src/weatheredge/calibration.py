@@ -13,8 +13,10 @@ import logging
 import numpy as np
 
 from weatheredge.mesonet import DailyObservation
+from weatheredge.cache import cache_key as _cache_key, read_cache, write_cache
 
 logger = logging.getLogger("weatheredge.calibration")
+_SUBDIR = "calibration_cache"
 
 
 # =========================================================================
@@ -320,17 +322,29 @@ async def run_calibration(
     """
     import asyncio
     import numpy as np
-    from datetime import date, timedelta
+    from datetime import date, timedelta, datetime
     from weatheredge.calibration import StationBias, CalibrationPair, build_calibration, apply_calibration
     from weatheredge.backtest_fetchers import fetch_historical_forecast_ensemble
     from weatheredge.mesonet import fetch_daily_observations
     from weatheredge.stations import get_station
 
+    end = end_date or (date.today() - timedelta(days=1))
+    
+    ck = _cache_key("calibration", station_id, str(days), end.isoformat())
+    cached = read_cache(_SUBDIR, ck, max_age_hours=24.0)
+    if cached is not None:
+        try:
+            bias_dict = cached["bias"]
+            # Reconstruct StationBias dataclass
+            bias = StationBias(**bias_dict)
+            return bias, cached["metrics"]
+        except Exception as e:
+            logger.debug(f"Failed to load cached calibration for {station_id}: {e}")
+
     station = get_station(station_id)
     if not station:
         raise ValueError(f"Unknown station: {station_id}")
 
-    end = end_date or (date.today() - timedelta(days=1))
     start = end - timedelta(days=days)
 
     logger.info("Fetching %d days of data for %s...", days, station_id)
@@ -406,6 +420,13 @@ async def run_calibration(
         "oos_improvement_pct": improvement * 100,
         "is_valid": improvement > 0,
     }
+
+    # Cache the result
+    import dataclasses
+    write_cache(_SUBDIR, ck, {
+        "bias": dataclasses.asdict(bias),
+        "metrics": metrics
+    })
 
     return bias, metrics
 

@@ -7,15 +7,15 @@ Disk cache ensures deterministic reruns and avoids API abuse.
 
 from __future__ import annotations
 
-import hashlib
+import asyncio
 import json
 import logging
 from datetime import date, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 import httpx
 
+from weatheredge.cache import cache_key as _cache_key, read_cache, write_cache, cache_fingerprint as _cache_fp
 from weatheredge.config import (
     OPEN_METEO_API_KEY,
     OPEN_METEO_HISTORICAL,
@@ -27,45 +27,31 @@ from weatheredge.polymarket import _is_weather_market, _raw_to_parsed_market, pa
 
 log = logging.getLogger("weatheredge.backtest_fetchers")
 
-# ---------------------------------------------------------------------------
-# Disk cache
-# ---------------------------------------------------------------------------
+_SUBDIR = "backtest_cache"
 
-_CACHE_DIR = Path.home() / ".weatheredge" / "backtest_cache"
+# Global semaphore to prevent hammering Open-Meteo API with concurrent requests
+# (especially during walk-forward calibration which fetches 365 days x N models)
+_open_meteo_sems: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
 
+def _get_open_meteo_sem() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    if loop not in _open_meteo_sems:
+        _open_meteo_sems[loop] = asyncio.Semaphore(1)
+    return _open_meteo_sems[loop]
 
-def _cache_key(*parts: str) -> str:
-    """Deterministic filename from key components."""
-    raw = "|".join(str(p) for p in parts)
-    return hashlib.sha256(raw.encode()).hexdigest()[:16] + ".json"
 
 
 def _read_cache(key: str) -> dict | None:
-    path = _CACHE_DIR / key
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-    return None
+    return read_cache(_SUBDIR, key)
 
 
 def _write_cache(key: str, data: Any) -> None:
-    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    path = _CACHE_DIR / key
-    path.write_text(json.dumps(data, default=str), encoding="utf-8")
+    write_cache(_SUBDIR, key, data)
 
 
 def cache_fingerprint() -> str:
     """Hash of all cached files — identifies the exact data snapshot."""
-    if not _CACHE_DIR.exists():
-        return "empty"
-    files = sorted(_CACHE_DIR.glob("*.json"))
-    h = hashlib.sha256()
-    for f in files:
-        h.update(f.name.encode())
-        h.update(f.read_bytes())
-    return h.hexdigest()[:16]
+    return _cache_fp(_SUBDIR)
 
 
 # =========================================================================
@@ -382,13 +368,13 @@ async def fetch_historical_forecast(
             async with httpx.AsyncClient(timeout=30) as client:
                 max_retries = 5
                 for attempt in range(max_retries):
-                    resp = await client.get(OPEN_METEO_HISTORICAL, params=params)
+                    async with _get_open_meteo_sem():
+                        resp = await client.get(OPEN_METEO_HISTORICAL, params=params)
                     
                     if resp.status_code == 429:
                         wait_time = (2 ** attempt) + 1
                         log.warning("Rate limited (429). Retrying in %ds... (attempt %d/%d)", 
                                     wait_time, attempt + 1, max_retries)
-                        import asyncio
                         await asyncio.sleep(wait_time)
                         continue
                         

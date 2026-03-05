@@ -9,44 +9,29 @@ https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py
 from __future__ import annotations
 
 import csv
-import hashlib
 import io
-import json
 import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 import httpx
 import numpy as np
 
+from weatheredge.cache import cache_key as _cache_key, read_cache, write_cache
+
 log = logging.getLogger("weatheredge.mesonet")
 
 IEM_BASE = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
-_CACHE_DIR = Path.home() / ".weatheredge" / "mesonet_cache"
-
-
-def _cache_key(*parts: str) -> str:
-    """Deterministic filename from key components."""
-    raw = "|".join(str(p) for p in parts)
-    return hashlib.sha256(raw.encode()).hexdigest()[:16] + ".json"
+_SUBDIR = "mesonet_cache"
 
 
 def _read_cache(key: str) -> list[dict[str, str]] | None:
-    path = _CACHE_DIR / key
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-    return None
+    return read_cache(_SUBDIR, key)
 
 
 def _write_cache(key: str, data: Any) -> None:
-    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    path = _CACHE_DIR / key
-    path.write_text(json.dumps(data, default=str), encoding="utf-8")
+    write_cache(_SUBDIR, key, data)
 
 
 # =========================================================================

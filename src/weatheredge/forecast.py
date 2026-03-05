@@ -14,8 +14,11 @@ from typing import Any
 import httpx
 import numpy as np
 
+from weatheredge.cache import cache_key as _cache_key, read_cache, write_cache
 from weatheredge.config import FORECAST_DAYS, OPEN_METEO_BASE, OPEN_METEO_MODELS, OPEN_METEO_API_KEY
 from weatheredge.models import ForecastResult
+
+_SUBDIR = "forecast_cache"
 
 OPEN_METEO_ENSEMBLE = "https://ensemble-api.open-meteo.com/v1/ensemble"
 
@@ -145,9 +148,25 @@ async def fetch_regime_data(
     Fetch atmospheric regime variables: CAPE, 850hPa winds.
     These are used by the meteorologist regime flags.
     """
+    lat_r = round(latitude, 4)
+    lon_r = round(longitude, 4)
+    ck = _cache_key("regime", str(lat_r), str(lon_r), str(forecast_days))
+    cached = read_cache(_SUBDIR, ck, max_age_hours=1.0)
+    if cached is not None:
+        return [
+            AtmosphericRegime(
+                station_id=r.get("station_id", ""),
+                valid_date=date.fromisoformat(r["valid_date"]),
+                cape_max=r.get("cape_max"),
+                wind_dir_850hpa=r.get("wind_dir_850hpa"),
+                wind_speed_850hpa=r.get("wind_speed_850hpa"),
+            )
+            for r in cached
+        ]
+
     params = {
-        "latitude": latitude,
-        "longitude": longitude,
+        "latitude": lat_r,
+        "longitude": lon_r,
         "hourly": "cape,windspeed_850hPa,winddirection_850hPa",
         "timezone": timezone,
         "forecast_days": forecast_days,
@@ -195,6 +214,18 @@ async def fetch_regime_data(
             wind_speed_850hpa=float(np.mean(d["ws"])) if d["ws"] else None,
         ))
 
+    # Cache the results
+    write_cache(_SUBDIR, ck, [
+        {
+            "station_id": r.station_id,
+            "valid_date": r.valid_date.isoformat(),
+            "cape_max": r.cape_max,
+            "wind_dir_850hpa": r.wind_dir_850hpa,
+            "wind_speed_850hpa": r.wind_speed_850hpa,
+        }
+        for r in results
+    ])
+
     return results
 
 
@@ -213,9 +244,27 @@ async def _fetch_ensemble(
     Fetch ensemble (51 ECMWF members or 18 BOM members) from Open-Meteo ensemble API.
     Gives real probabilistic uncertainty instead of multi-model hack.
     """
+    lat_r = round(lat, 4)
+    lon_r = round(lon, 4)
+    ck = _cache_key("ensemble", str(lat_r), str(lon_r), model, str(forecast_days))
+    cached = read_cache(_SUBDIR, ck, max_age_hours=1.0)
+    if cached is not None:
+        return [
+            ForecastResult(
+                station_id=r.get("station_id", ""),
+                valid_date=date.fromisoformat(r["valid_date"]),
+                tmax_mean=r["tmax_mean"],
+                tmax_std=r["tmax_std"],
+                tmin_mean=r.get("tmin_mean"),
+                tmin_std=r.get("tmin_std"),
+                models_used=r.get("models_used", []),
+            )
+            for r in cached
+        ]
+
     params = {
-        "latitude": lat,
-        "longitude": lon,
+        "latitude": lat_r,
+        "longitude": lon_r,
         "daily": "temperature_2m_max,temperature_2m_min",
         "timezone": timezone,
         "forecast_days": forecast_days,
@@ -293,6 +342,19 @@ async def _fetch_ensemble(
             models_used=[f"{model}_ensemble"],
         ))
 
+    # Cache results
+    def _fc_to_dict(r: ForecastResult) -> dict:
+        return {
+            "station_id": r.station_id,
+            "valid_date": r.valid_date.isoformat(),
+            "tmax_mean": r.tmax_mean,
+            "tmax_std": r.tmax_std,
+            "tmin_mean": r.tmin_mean,
+            "tmin_std": r.tmin_std,
+            "models_used": r.models_used,
+        }
+    write_cache(_SUBDIR, ck, [_fc_to_dict(r) for r in results])
+
     return results
 
 
@@ -308,6 +370,13 @@ async def _fetch_raw_multimodel(
     forecast_days: int,
 ) -> dict[str, dict[str, list[float]]]:
     """Fetch deterministic forecasts from multiple models."""
+    lat_r = round(lat, 4)
+    lon_r = round(lon, 4)
+    ck = _cache_key("multimodel", str(lat_r), str(lon_r), ",".join(sorted(models)), str(forecast_days))
+    cached = read_cache(_SUBDIR, ck, max_age_hours=1.0)
+    if cached is not None:
+        return cached
+
     results: dict[str, dict[str, Any]] = {}
 
     async with httpx.AsyncClient(timeout=30) as client:
@@ -341,6 +410,9 @@ async def _fetch_raw_multimodel(
                     "tmax": [v if v is not None else float("nan") for v in tmax],
                     "tmin": [v if v is not None else float("nan") for v in tmin],
                 }
+
+    if results:
+        write_cache(_SUBDIR, ck, results)
 
     return results
 
