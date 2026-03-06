@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from weatheredge.config import TRADING
 
 
 # =========================================================================
@@ -85,8 +86,7 @@ def volume_impact_estimate(
 
     # Kyle's lambda: impact = coefficient * (bet / sqrt(volume))
     # Coefficient chosen so a $300 bet in a $5,000 market ≈ 2% impact
-    LAMBDA_COEFF = 0.5
-    impact = LAMBDA_COEFF * bet_size_usd / math.sqrt(market_volume)
+    impact = TRADING.slippage_lambda_coeff * bet_size_usd / math.sqrt(market_volume)
 
     return max(0.0, impact)
 

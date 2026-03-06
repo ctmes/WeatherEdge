@@ -104,7 +104,7 @@ class BacktestConfig(TypedDict, total=False):
     bankroll: float
 
     model: str          # ecmwf_ifs, gfs_seamless, etc.
-
+    fidelity: str       # "snapshot" (default) or "tick"
     kelly_fraction: float
 
     use_ensemble: bool
@@ -113,7 +113,8 @@ class BacktestConfig(TypedDict, total=False):
 
     calibrations: dict   # {station_id: StationBias} — passed through to pipeline
 
-    data_source: str     # "gamma" (default) or "pmxt" (archive.pmxt.dev)
+    data_source: str     # "gamma" or "pmxt" (archive.pmxt.dev)
+    latency_seconds: int
 
     walk_forward: bool   # Enable monthly recalibration to prevent lookahead bias
 
@@ -162,7 +163,7 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
     use_ensemble = cfg.get("use_ensemble", False)
 
     mode = cfg.get("mode", "brier_only")
-
+    fidelity = cfg.get("fidelity", "snapshot")
     calibrations = cfg.get("calibrations", {})
     data_source = cfg.get("data_source", "gamma")
     walk_forward = cfg.get("walk_forward", False)
@@ -560,7 +561,19 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
 
             for sig in signals:
                 won = sig.bin_index == resolved_bin
-                pnl = _calculate_pnl(sig, won)
+                # For backtesting, we simulate actual fill.
+                # In 'tick' fidelity, we use the enriched market_prob (from PMXT/Ticks).
+                # In 'snapshot' fidelity, we use Gamma price + theoretical slippage.
+                if fidelity == "tick":
+                    # The market_prob here is already the enriched price from pmxt_fetcher
+                    actual_fill = min(sig.market_prob + 0.005, 0.99)
+                    # Empirical slippage is the difference between our fill and the midpoint
+                    actual_slip = 0.005 
+                else:
+                    actual_fill = min((sig.market_prob or 0.5) + sig.slippage, 0.99)
+                    actual_slip = sig.slippage
+                
+                pnl = _calculate_pnl(sig, won, override_fill=actual_fill)
                 rolling_bankroll += pnl
                 equity_curve.append(rolling_bankroll)
                 
@@ -579,13 +592,8 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
                 tqdm.write(f"\n[{decision_date}] {q_safe[:65]}")
                 tqdm.write(f"  Forecast: {forecast.tmax_mean:.1f}°C (std={forecast.tmax_std:.1f})")
                 tqdm.write(f"  Bet:      \033[1m{sig.bin_label}\033[0m @ {sig.model_prob:.0%} model vs {sig.market_prob:.0%} market")
-                tqdm.write(f"  Slippage: {sig.slippage:.1%} | Edge: {sig.net_edge:+.1%} | Size: ${sig.recommended_bet_usd:.0f}")
+                tqdm.write(f"  Fidelity: {fidelity.upper()} | Fill: {actual_fill:.3f} | Slip: {actual_slip:+.3f}")
                 tqdm.write(f"  Actual:   {resolved_label} → {win_loss_label} | P&L: {pnl:+.2f} | Bankroll: ${rolling_bankroll:,.0f}")
-
-                # For backtesting, we simulate actual fill as market_prob + slippage
-                # where 'slippage' here is the one calculated by _process_market
-                actual_fill = min((sig.market_prob or 0.5) + sig.slippage, 0.99)
-                actual_slip = sig.slippage  # In backtest simple mode, they are the same
                 
                 all_signals.append(sig)
                 all_results.append({
@@ -691,6 +699,8 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
                 resolved_bin=record["resolved_bin"],
                 won=record["won"],
                 pnl_usd=record["pnl"],
+                actual_fill_price=record.get("actual_fill_price"),
+                actual_slippage=record.get("actual_slippage"),
                 resolved_at=datetime.utcnow(),
             ))
 
@@ -751,36 +761,25 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
 
 
 
-def _calculate_pnl(sig: EdgeSignal, won: bool) -> float:
-
+def _calculate_pnl(sig: EdgeSignal, won: bool, override_fill: float | None = None) -> float:
     """
-
     Paper P&L for a single signal, accounting for slippage.
 
-
-
-    Fill price = market_prob + slippage (capped at 0.99)
-    Win:  gross_profit * (1 - fee)
-
-    Loss: -bet_size
-
+    If override_fill is provided (e.g. from tick simulation), uses that.
+    Otherwise falls back to market_prob + theoretical slippage.
     """
-
     if won:
-
-        fill_price = min(sig.market_prob + sig.slippage, 0.99)
+        if override_fill is not None:
+            fill_price = override_fill
+        else:
+            fill_price = min(sig.market_prob + sig.slippage, 0.99)
 
         if fill_price > 0:
-
             gross = sig.recommended_bet_usd * (1.0 / fill_price - 1.0)
-
         else:
-
             gross = 0.0
 
         return gross * (1.0 - TRADING.polymarket_fee)
-
     else:
-
         return -sig.recommended_bet_usd
 

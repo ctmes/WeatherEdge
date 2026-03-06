@@ -265,6 +265,11 @@ def main() -> None:
         help="Simulated delay between model release and bot execution (default: 60)",
     )
     bt_parser.add_argument(
+        "--fidelity", type=str, default="snapshot",
+        choices=["snapshot", "tick"],
+        help="Backtest fidelity: snapshot (Gamma) or tick (PMXT/Local)",
+    )
+    bt_parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable debug logging",
     )
 
@@ -884,8 +889,9 @@ def _run_backtest(args: argparse.Namespace) -> None:
             "use_ensemble": args.ensemble,
             "mode": args.mode,
             "data_source": args.source,
-            "walk_forward": getattr(args, "walk_forward", False),
+            "walk_forward": args.walk_forward,
             "latency_seconds": args.latency_seconds,
+            "fidelity": args.fidelity,
             "calibrations": cals,
         }
 

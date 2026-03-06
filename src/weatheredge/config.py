@@ -157,6 +157,7 @@ class TradingConfig:
     min_liquidity: float = 5_000                # $5,000 minimum market volume
     polymarket_fee: float = 0.02                # 2% fee on winning trades
     assumed_slippage: float = 0.03              # 3% penalty when crossing bid/ask spread
+    slippage_lambda_coeff: float = 0.5          # Kyle's Lambda for volume impact
     kelly_fraction: float = 0.25                # 25% fractional Kelly
     kelly_max_bet: float = 0.10                 # 10% bankroll cap per cluster
     stop_loss_pct: float = 0.20                 # 20% adverse move → exit
