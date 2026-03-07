@@ -24,7 +24,7 @@ load_dotenv(_PROJECT_ROOT / ".env")
 
 DATABASE_URL: str = os.getenv(
     "DATABASE_URL",
-    f"sqlite+aiosqlite:///{_PROJECT_ROOT / 'weatheredge.db'}",
+    f"sqlite+aiosqlite:///{_PROJECT_ROOT / 'data' / 'weatheredge.db'}",
 )
 
 

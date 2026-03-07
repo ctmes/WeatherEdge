@@ -12,7 +12,7 @@ from weatheredge.logger import log_scan
 from weatheredge.pipeline import fetch_weather_markets, get_station, fetch_forecast, fetch_regime_data, _process_market, AtmosphericRegime
 from weatheredge.ws_client import WeatherEdgeMarketWS, OrderbookSnapshot, TradeEvent
 from weatheredge.models import ParsedMarket, ForecastResult
-from weatheredge.execution import execute_signal
+from weatheredge.execution import execute_signal, load_open_positions, clear_executed_signals
 from weatheredge.config import TRADING
 
 logger = logging.getLogger("weatheredge.live_paper")
@@ -30,6 +30,10 @@ async def run_live_paper(
 
     async with get_session() as session:
         calibrations = await get_calibrations(session)
+
+    # Seed the execution deduplication cache from DB so positions placed in
+    # prior runs are not re-fired after a restart or redeployment.
+    await load_open_positions()
 
     ws = WeatherEdgeMarketWS()
 
@@ -79,6 +83,10 @@ async def run_live_paper(
 
             last_market_refresh = datetime.utcnow()
             logger.info("Metadata refresh complete for %d stations.", len(unique_stations))
+            # Clear the in-memory dedup cache after a refresh — resolved markets
+            # will have dropped out of the open-position query so the DB re-seed
+            # on the next execution will correctly allow fresh signals on new markets.
+            clear_executed_signals()
 
         except Exception:
             logger.exception(

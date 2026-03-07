@@ -36,13 +36,8 @@ CLIMATE_KEYWORDS = ["temperature increase", "hottest on record", "hottest month"
 
 async def _get_json(url: str, params: dict | None = None) -> Any:
     """Async GET → JSON with sensible timeout and SSL verification toggle."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Origin": "https://polymarket.com",
-        "Referer": "https://polymarket.com/",
-    }
     try:
-        async with httpx.AsyncClient(timeout=30, verify=VERIFY_SSL, headers=headers) as client:
+        async with httpx.AsyncClient(timeout=30, verify=VERIFY_SSL) as client:
             resp = await client.get(url, params=params or {})
             resp.raise_for_status()
             return resp.json()
@@ -51,6 +46,172 @@ async def _get_json(url: str, params: dict | None = None) -> Any:
             log.error("SSL Verification failed. This is likely due to a hostname mismatch on Polymarket's Gamma API (Azure Front Door).")
             log.error("FIX: Run with `export VERIFY_SSL=false` or set it in your .env file.")
         raise
+
+
+# =========================================================================
+# CLOB token ID enrichment
+# =========================================================================
+
+async def _fetch_clob_token_ids(condition_id: str) -> list[str]:
+    """
+    Look up the real CLOB token IDs for a market using its condition ID.
+
+    The Gamma API sometimes returns empty ``clobTokenIds`` for child markets.
+    Falling back to the condition ID as a subscription key is wrong — the
+    CLOB WebSocket uses token IDs (one per outcome), not condition IDs.
+
+    ``GET /markets?condition_id=<id>`` returns a list of market dicts each
+    with a ``tokens`` array.  We collect the ``token_id`` from every token
+    across all matching markets.
+
+    Results are cached for 1 hour since token IDs never change for a given
+    condition.
+    """
+    ck = _cache_key("clob_tokens", condition_id)
+    cached = read_cache(_SUBDIR, ck, max_age_hours=60)
+    if cached is not None:
+        return cached
+
+    url = f"{POLYMARKET_CLOB_BASE}/markets"
+    try:
+        data = await _get_json(url, {"condition_id": condition_id})
+        # Response may be a single dict or a list
+        if isinstance(data, dict):
+            data = [data]
+        if not isinstance(data, list) or not data:
+            return []
+
+        token_ids: list[str] = []
+        for market in data:
+            for token in market.get("tokens", []):
+                tid = str(token.get("token_id", "")).strip()
+                if tid:
+                    token_ids.append(tid)
+
+        if token_ids:
+            write_cache(_SUBDIR, ck, token_ids)
+            log.debug(
+                "CLOB enrichment: resolved %d token IDs for condition %s",
+                len(token_ids), condition_id,
+            )
+        else:
+            log.warning(
+                "CLOB enrichment: no token IDs found for condition %s", condition_id
+            )
+        return token_ids
+
+    except Exception as e:
+        log.warning(
+            "CLOB enrichment: failed to fetch token IDs for condition %s: %s",
+            condition_id, e,
+        )
+        return []
+
+
+def _looks_like_condition_id(tid: str) -> bool:
+    """
+    Return True if ``tid`` looks like a condition ID rather than a real
+    CLOB token ID.
+
+    Polymarket token IDs are large decimal integers as strings, e.g.:
+        "71321045679452639895493894848938929495..."
+    Condition IDs are 0x-prefixed hex strings, e.g.:
+        "0x3f7d2c1a..."
+
+    When Gamma's ``clobTokenIds`` is empty and the code falls back to using
+    the condition ID as a token ID, the subscription silently fails because
+    the CLOB WebSocket does not recognise condition IDs as valid token keys.
+    """
+    tid = tid.strip()
+    if not tid:
+        return True
+    # Condition IDs are always 0x-prefixed hex
+    if tid.startswith("0x"):
+        return True
+    # Real token IDs are all digits (very large integers)
+    if not tid.isdigit():
+        return True
+    return False
+
+
+async def _enrich_missing_token_ids(markets: list[ParsedMarket]) -> None:
+    """
+    For every market whose ``token_ids`` appear to contain condition IDs
+    rather than real CLOB token IDs, fetch the correct token IDs from the
+    CLOB API and replace them in-place.
+
+    A token ID is identified as a probable condition ID (and therefore
+    wrong) when it matches the market's own ``condition_id`` — i.e. the
+    Gamma fallback path was taken during parsing.
+
+    This is the fix for the 7/9 zero-price issue: without correct token IDs
+    the WebSocket subscription is silently ignored by the CLOB server and
+    no orderbook events are ever delivered.
+    """
+    import asyncio
+
+    needs_enrichment = [
+        m for m in markets
+        if not m.token_ids or any(_looks_like_condition_id(tid) for tid in m.token_ids)
+    ]
+
+    if not needs_enrichment:
+        return
+
+    log.info(
+        "CLOB enrichment: %d/%d markets have missing or fallback token IDs — "
+        "fetching real IDs from CLOB API",
+        len(needs_enrichment), len(markets),
+    )
+
+    async def _enrich_one(market: ParsedMarket) -> None:
+        # For event-based markets (daily weather) the token_ids list stores
+        # per-bin child token IDs. We need to enrich each child individually
+        # using the condition_id stored in the CHILD_IDS footer of description.
+        child_ids = _extract_child_ids_from_description(market.description)
+
+        if child_ids:
+            # Fetch token IDs for every child condition and flatten
+            results = await asyncio.gather(
+                *[_fetch_clob_token_ids(cid) for cid in child_ids],
+                return_exceptions=True,
+            )
+            new_token_ids: list[str] = []
+            for r in results:
+                if isinstance(r, list):
+                    # Take only the YES token (index 0) per child market
+                    if r:
+                        new_token_ids.append(r[0])
+            if new_token_ids:
+                market.token_ids = new_token_ids
+                log.info(
+                    "CLOB enrichment: market %s updated with %d child token IDs",
+                    market.condition_id, len(new_token_ids),
+                )
+        else:
+            # Single-outcome market — look up by the market's own condition ID
+            token_ids = await _fetch_clob_token_ids(market.condition_id)
+            if token_ids:
+                market.token_ids = token_ids
+                log.info(
+                    "CLOB enrichment: market %s updated with %d token IDs",
+                    market.condition_id, len(token_ids),
+                )
+
+    await asyncio.gather(*[_enrich_one(m) for m in needs_enrichment])
+
+
+def _extract_child_ids_from_description(description: str) -> list[str]:
+    """
+    Extract child condition IDs from the ``CHILD_IDS:`` footer appended by
+    ``parse_daily_weather_event``.
+
+    Returns an empty list if no footer is present.
+    """
+    match = re.search(r"CHILD_IDS:([^\n]+)", description or "")
+    if not match:
+        return []
+    return [cid.strip() for cid in match.group(1).split(",") if cid.strip()]
 
 
 # =========================================================================
@@ -116,7 +277,14 @@ async def fetch_weather_markets(
         offset += page_size
 
     log.info("Fetched %d additional markets from /markets endpoint", len(market_markets))
-    return event_markets + market_markets
+    all_markets = event_markets + market_markets
+
+    # Enrich any markets where Gamma returned empty clobTokenIds — without
+    # real token IDs the WebSocket subscription is silent and all prices
+    # will be zero.
+    await _enrich_missing_token_ids(all_markets)
+
+    return all_markets
 
 
 async def fetch_weather_events(
