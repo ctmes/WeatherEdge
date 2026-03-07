@@ -23,6 +23,7 @@ from weatheredge.probability import (
     normalise_market_probs,
     recommended_bet_usd,
 )
+from weatheredge.ws_client import OrderbookSnapshot  # Import new type
 from weatheredge.regime import RegimeAssessment, adjust_edge_threshold, assess_regime
 from weatheredge.safety import PositionLimits, check_position_limits
 from weatheredge.stations import get_station
@@ -221,7 +222,7 @@ def _process_market(
     eval_date: date | None = None,
     current_market_exposure: float = 0.0,
     current_total_exposure: float = 0.0,
-    orderbooks: dict[str, dict] | None = None,
+    orderbooks: dict[str, OrderbookSnapshot | dict] | None = None,
 ) -> tuple[list[EdgeSignal], dict[str, Any] | None]:
     """Generate EdgeSignals for one market, applying calibration + regime checks."""
 
@@ -343,18 +344,31 @@ def _process_market(
             # For daily events, token_ids map one-to-one with bins
             tid = market.token_ids[i] if i < len(market.token_ids) else None
             book = orderbooks.get(tid) if tid else None
-            if book:
+            
+            if isinstance(book, OrderbookSnapshot):
+                # Convert snapshot to lists for legacy filters if needed, 
+                # but better to use its properties directly.
+                bids_list = [[l.price, l.size] for l in book.bids]
+                asks_list = [[l.price, l.size] for l in book.asks]
+                integrity = check_midpoint_integrity(bids_list, asks_list)
+                integrity_multiplier = integrity["multiplier"]
+                
+                # Update mkt_p with midpoint from live book if available
+                mkt_p = book.mid_price
+            elif isinstance(book, dict):
                 integrity = check_midpoint_integrity(book.get("bids"), book.get("asks"))
                 integrity_multiplier = integrity["multiplier"]
-                if integrity["is_spooky"]:
-                    logger.warning(
-                        "Market %s bin %d classified as spooky: %s (multiplier %.2f)",
-                        market.condition_id, i, integrity["reason"], integrity_multiplier
-                    )
             elif len(market.token_ids) == 0:
                 # Binary market fallback
                 book = orderbooks.get(market.condition_id)
-                if book:
+                if isinstance(book, OrderbookSnapshot):
+                    integrity = check_midpoint_integrity(
+                        [[l.price, l.size] for l in book.bids],
+                        [[l.price, l.size] for l in book.asks]
+                    )
+                    integrity_multiplier = integrity["multiplier"]
+                    mkt_p = book.mid_price
+                elif isinstance(book, dict):
                     integrity = check_midpoint_integrity(book.get("bids"), book.get("asks"))
                     integrity_multiplier = integrity["multiplier"]
                 else:
@@ -383,9 +397,19 @@ def _process_market(
                 bet = bankroll * 0.03
 
             # Refine slippage now that we know the actual bet size
+            # Use orderbook depth if available for Tier 1 slippage
+            depth = None
+            if orderbooks:
+                tid = market.token_ids[i] if i < len(market.token_ids) else None
+                book = orderbooks.get(tid) if tid else None
+                if isinstance(book, OrderbookSnapshot):
+                    # For slippage calculation, we use (price, qty_usd)
+                    depth = [(l.price, l.price * l.size) for l in book.asks]
+
             dyn_slippage = estimate_slippage(
                 bet_size_usd=bet,
                 market_volume=market.volume,
+                order_book_depth=depth
             )
 
             # Recalculate edge with refined slippage

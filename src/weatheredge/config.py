@@ -35,6 +35,9 @@ DATABASE_URL: str = os.getenv(
 POLYMARKET_CLOB_BASE = "https://clob.polymarket.com"
 POLYMARKET_GAMMA_BASE = "https://gamma-api.polymarket.com"
 
+# SSL Verification
+VERIFY_SSL: bool = os.getenv("VERIFY_SSL", "true").lower() == "true"
+
 # Keywords used to filter weather markets from the full market list
 WEATHER_KEYWORDS: list[str] = [
     "temperature",
@@ -166,6 +169,9 @@ class TradingConfig:
     model_divergence_no_bet: float = 3.0        # °C — no bet if GFS/ECMWF differ by more
     ensemble_spread_reduce: float = 4.0         # °C — reduce sizing by 50%
     ensemble_spread_no_bet: float = 6.0         # °C — no bet
+
+    # Live Trading Toggle
+    live_trading_enabled: bool = False          # Set to True for real money (DANGEROUS)
 
 
 TRADING = TradingConfig()

@@ -5,12 +5,11 @@ and parse resolution rules from description text.
 
 from __future__ import annotations
 
-import logging
+import logging  # FIX #1: removed duplicate import
 import re
 from datetime import date, datetime
 from typing import Any
 
-import logging
 import httpx
 
 log = logging.getLogger("weatheredge.polymarket")
@@ -21,6 +20,7 @@ from weatheredge.config import (
     POLYMARKET_GAMMA_BASE,
     NON_WEATHER_BLOCKLIST,
     WEATHER_KEYWORDS,
+    VERIFY_SSL,
 )
 from weatheredge.models import ParsedMarket
 
@@ -30,17 +30,27 @@ _SUBDIR = "polymarket_cache"
 CLIMATE_KEYWORDS = ["temperature increase", "hottest on record", "hottest month", "hottest year"]
 
 
-
 # =========================================================================
 # API helpers
 # =========================================================================
 
 async def _get_json(url: str, params: dict | None = None) -> Any:
-    """Async GET → JSON with sensible timeout."""
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(url, params=params or {})
-        resp.raise_for_status()
-        return resp.json()
+    """Async GET → JSON with sensible timeout and SSL verification toggle."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Origin": "https://polymarket.com",
+        "Referer": "https://polymarket.com/",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30, verify=VERIFY_SSL, headers=headers) as client:
+            resp = await client.get(url, params=params or {})
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.ConnectError as e:
+        if "CERTIFICATE_VERIFY_FAILED" in str(e) and VERIFY_SSL:
+            log.error("SSL Verification failed. This is likely due to a hostname mismatch on Polymarket's Gamma API (Azure Front Door).")
+            log.error("FIX: Run with `export VERIFY_SSL=false` or set it in your .env file.")
+        raise
 
 
 # =========================================================================
@@ -187,15 +197,29 @@ def _is_weather_market(item: dict) -> bool:
     # Check for keywords
     for kw in WEATHER_KEYWORDS + CLIMATE_KEYWORDS:
         if kw in searchable:
-            # For short or common words, require word boundaries to avoid 
-            # false positives like "ukraine" matching "rain" or "wind" 
+            # For short or common words, require word boundaries to avoid
+            # false positives like "ukraine" matching "rain" or "wind"
             # in names.
             if kw in ("rain", "temp", "wind", "ice", "cold", "heat"):
                 if not re.search(rf"\b{kw}\b", searchable):
                     continue
             return True
-            
+
     return False
+
+
+def _extract_condition_id(item: dict) -> str:
+    """
+    FIX #9: Consistently extract a condition/market ID from a raw API dict.
+
+    Polymarket's Gamma API uses ``conditionId`` for CLOB-linked markets and
+    ``id`` as a fallback UUID.  Always prefer ``conditionId`` when present and
+    non-empty, as it is the canonical identifier used by the CLOB and PMXT.
+    """
+    cid = item.get("conditionId", "").strip()
+    if cid:
+        return cid
+    return item.get("id", "").strip()
 
 
 def _raw_to_parsed_market(item: dict) -> ParsedMarket | None:
@@ -230,7 +254,14 @@ def _raw_to_parsed_market(item: dict) -> ParsedMarket | None:
         # Token IDs may come from clobTokenIds
         token_ids_raw = item.get("clobTokenIds", "")
         if isinstance(token_ids_raw, str):
-            token_ids = [t.strip() for t in token_ids_raw.split(",") if t.strip()]
+            if token_ids_raw.strip().startswith("["):
+                try:
+                    token_ids = json.loads(token_ids_raw)
+                    token_ids = [str(t) for t in token_ids]
+                except json.JSONDecodeError:
+                    token_ids = [t.strip() for t in token_ids_raw.split(",") if t.strip()]
+            else:
+                token_ids = [t.strip() for t in token_ids_raw.split(",") if t.strip()]
         elif isinstance(token_ids_raw, list):
             token_ids = [str(t) for t in token_ids_raw]
         else:
@@ -239,8 +270,9 @@ def _raw_to_parsed_market(item: dict) -> ParsedMarket | None:
         description = item.get("description", "")
         question = item.get("question", "")
 
+        # FIX #9: use unified condition ID extractor
         market = ParsedMarket(
-            condition_id=item.get("conditionId", item.get("id", "")),
+            condition_id=_extract_condition_id(item),
             question=question,
             outcomes=outcomes,
             outcome_prices=outcome_prices,
@@ -250,9 +282,14 @@ def _raw_to_parsed_market(item: dict) -> ParsedMarket | None:
             description=description,
         )
 
-        # Attempt to parse resolution rules from the description and title
+        # FIX #10: detect unit once here; pass it into parse_resolution_rules
         group_title = item.get("groupItemTitle", "")
-        parsed = parse_resolution_rules(description, question, group_title, outcomes)
+        detected_unit = _detect_unit(question + " " + description + " " + group_title)
+
+        # Attempt to parse resolution rules from the description and title
+        parsed = parse_resolution_rules(
+            description, question, group_title, outcomes, detected_unit=detected_unit
+        )
         market.station_id = parsed.get("station_id")
         market.metric = parsed.get("metric")
         market.bins = parsed.get("bins", [])
@@ -270,25 +307,29 @@ def _raw_to_parsed_market(item: dict) -> ParsedMarket | None:
                         break
 
         # --- Unit Normalization ---
-        # Definitive fix: everything normalized to Celsius for probability.py
+        # Everything normalised to Celsius for probability.py.
+        # FIX #10: reuse the already-detected unit rather than detecting again.
         from weatheredge.stations import get_station
         station = get_station(market.station_id) if market.station_id else None
-        
-        # Use station preferred unit as primary hint, fallback to text detection
-        detected_unit = _detect_unit(question + " " + description + " " + group_title)
         market_unit = station.preferred_unit if (station and station.preferred_unit) else detected_unit
 
         if market_unit == "F" and market.bins:
-            # Convert ºF bins to ºC
-            new_bins = []
-            for low, high in market.bins:
-                c_low = fahrenheit_to_celsius(low) if low != float("-inf") else float("-inf")
-                c_high = fahrenheit_to_celsius(high) if high != float("inf") else float("inf")
-                new_bins.append((c_low, c_high))
-            market.bins = new_bins
+            market.bins = [
+                (
+                    fahrenheit_to_celsius(low) if low != float("-inf") else float("-inf"),
+                    fahrenheit_to_celsius(high) if high != float("inf") else float("inf"),
+                )
+                for low, high in market.bins
+            ]
 
         return market
     except Exception:
+        # FIX #4: log the exception instead of silently swallowing it
+        log.exception(
+            "Failed to parse market (conditionId=%r, question=%r)",
+            item.get("conditionId", item.get("id", "unknown")),
+            item.get("question", ""),
+        )
         return None
 
 
@@ -323,7 +364,12 @@ _METRIC_PATTERNS = {
 # Temperature bin patterns — e.g., "Under 18", "18-20", "20-22", "Over 24"
 _BIN_UNDER = re.compile(r"[Uu]nder\s+([\d.]+)")
 _BIN_OVER = re.compile(r"[Oo]ver\s+([\d.]+)")
-_BIN_RANGE = re.compile(r"([\d.]+)\s*[-–]\s*([\d.]+)")
+# FIX #7: require °/degree context around the range to avoid matching
+# version strings, coordinates, and other non-temperature numeric ranges.
+_BIN_RANGE = re.compile(
+    r"([\d.]+)\s*[-–]\s*([\d.]+)\s*(?:°|degrees?\b)",
+    re.IGNORECASE,
+)
 
 # Known ICAO codes for our priority stations — used to prioritise matches
 _KNOWN_ICAO = {"NZWN", "EGLL", "KJFK", "KNYC", "KORD", "YSSY", "YMML", "RJTT"}
@@ -333,7 +379,9 @@ def parse_resolution_rules(
     description: str,
     question: str = "",
     group_title: str = "",
-    outcomes: list[str] = None,
+    outcomes: list[str] | None = None,
+    *,
+    detected_unit: str = "C",  # FIX #10: accept pre-detected unit to avoid double-detection
 ) -> dict[str, Any]:
     """
     Extract station ID, metric, bins, timezone, and date from a market's
@@ -344,7 +392,7 @@ def parse_resolution_rules(
     """
     if outcomes is None:
         outcomes = []
-        
+
     full_text = f"{question} {description} {group_title}"
     result: dict[str, Any] = {
         "station_id": None,
@@ -358,36 +406,40 @@ def parse_resolution_rules(
     is_climate = any(kw in full_text.lower() for kw in CLIMATE_KEYWORDS)
     if is_climate:
         result["station_id"] = "GLOBAL"
-        result["metric"] = "tmax" # Use tmax as a proxy for anomaly
-        
+        result["metric"] = "tmax"  # Use tmax as a proxy for anomaly
+
         # Determine the target bin from groupItemTitle or question
         search_text = f"{group_title} {question}"
         target_bin = None
-        
+
         under = _BIN_UNDER.search(search_text)
-        if under: target_bin = (float("-inf"), float(under.group(1)))
+        if under:
+            target_bin = (float("-inf"), float(under.group(1)))
         elif "<" in search_text:
             m = re.search(r"<([\d.]+)", search_text)
-            if m: target_bin = (float("-inf"), float(m.group(1)))
-            
+            if m:
+                target_bin = (float("-inf"), float(m.group(1)))
+
         over = _BIN_OVER.search(search_text)
-        if over: target_bin = (float(over.group(1)), float("inf"))
+        if over:
+            target_bin = (float(over.group(1)), float("inf"))
         elif ">" in search_text:
             m = re.search(r">([\d.]+)", search_text)
-            if m: target_bin = (float(m.group(1)), float("inf"))
-            
+            if m:
+                target_bin = (float(m.group(1)), float("inf"))
+
         rng = _BIN_RANGE.search(search_text)
-        if rng: target_bin = (float(rng.group(1)), float(rng.group(2)))
-        
+        if rng:
+            target_bin = (float(rng.group(1)), float(rng.group(2)))
+
         if target_bin and len(outcomes) == 2 and set(o.lower() for o in outcomes) == {"yes", "no"}:
-            # Standardise Yes/No outcomes to represent the target bin
-            # Index 0 is usually "Yes", Index 1 is "No". 
-            # We map Yes -> the target bin, No -> the inverse bin
+            # Standardise Yes/No outcomes to represent the target bin.
+            # Index 0 is usually "Yes", Index 1 is "No".
             if outcomes[0].lower() == "yes":
-                result["bins"] = [target_bin, (float("-inf"), float("inf"))] # [Yes bin, No bin (all else)]
+                result["bins"] = [target_bin, (float("-inf"), float("inf"))]
             else:
                 result["bins"] = [(float("-inf"), float("inf")), target_bin]
-            
+
     # --- Station ID ---
     if result["station_id"] is None:
         # Try Wunderground reference first
@@ -416,10 +468,22 @@ def parse_resolution_rules(
             if re.search(r"\btemp", full_text, re.IGNORECASE):
                 result["metric"] = "tmax"
 
-    # --- Bins from outcomes ---
-    # Bins are better extracted at the market level from outcomes list,
-    # but we can also pull them from the description text
-    # (see parse_bins_from_outcomes for the primary method)
+    # --- Bins ---
+    # FIX #8: for regular (non-climate) markets, parse bins from outcomes when
+    # available, rather than always returning an empty list.
+    if not result["bins"] and outcomes:
+        parsed_bins = parse_bins_from_outcomes(outcomes)
+        if parsed_bins:
+            # Convert to Celsius if the market unit is Fahrenheit
+            if detected_unit == "F":
+                parsed_bins = [
+                    (
+                        fahrenheit_to_celsius(lo) if lo != float("-inf") else float("-inf"),
+                        fahrenheit_to_celsius(hi) if hi != float("inf") else float("inf"),
+                    )
+                    for lo, hi in parsed_bins
+                ]
+            result["bins"] = parsed_bins
 
     # --- Timezone ---
     tz_match = re.search(
@@ -493,7 +557,7 @@ async def fetch_midpoint_prices(token_ids: list[str]) -> dict[str, float]:
     """
     if not token_ids:
         return {}
-        
+
     sorted_ids = sorted(token_ids)
     ck = _cache_key("midpoints", *sorted_ids)
     cached = read_cache(_SUBDIR, ck, max_age_hours=2/60)  # 2 min TTL
@@ -525,40 +589,59 @@ def fahrenheit_to_celsius(f: float) -> float:
 def _detect_unit(text: str) -> str:
     """Detect if Fahrenheit or Celsius from text."""
     search = text.lower()
-    
+
     # Check for explicit phrases first
     if "degrees celsius" in search or "degrees c" in search:
         return "C"
     if "degrees fahrenheit" in search or "degrees f" in search:
         return "F"
-        
+
     # Check for symbols with numbers
     if re.search(r"\d+\s*°c", search) or re.search(r"\bcelsius\b", search):
         return "C"
     if re.search(r"\d+\s*°f", search) or re.search(r"\bfahrenheit\b", search):
         return "F"
-        
+
     # If both or neither, check for symbols
     if "°c" in search:
         return "C"
     if "°f" in search:
         return "F"
-        
-    # Default to Celsius for international safety, 
+
+    # Default to Celsius for international safety,
     # but the calling code should prioritize station metadata.
     return "C"
 
 
 def _extract_city_from_title(title: str) -> str | None:
-    """Extract city name from 'Highest temperature in NYC on March 3?'"""
-    # Try more robust pattern that handles variations in spacing and punctuation
-    match = re.search(
-        r"temperature\sin\s+([^?]+?)\s+(?:on|be|reach|stay)\b",
+    """
+    Extract city name from titles like:
+        'Highest temperature in NYC on March 3?'
+        'Will the high temperature in New York City reach 80°F?'
+
+    FIX #5: broadened regex so multi-word city names and varied phrasing
+    are handled correctly.  The previous pattern broke on cities containing
+    prepositions (e.g. "Port of Spain") and on titles that used "reach" or
+    "be" but not immediately after the city name.
+    """
+    # Primary pattern: "in <city> on/be/reach/stay"
+    m = re.search(
+        r"\bin\s+([A-Za-z][A-Za-z\s\-\.]{1,40}?)\s+(?:on|be|reach|stay)\b",
         title,
         re.IGNORECASE,
     )
-    if match:
-        return match.group(1).strip()
+    if m:
+        return m.group(1).strip()
+
+    # Fallback: "in <city>?" at end of title (no action verb present)
+    m = re.search(
+        r"\bin\s+([A-Za-z][A-Za-z\s\-\.]{1,40}?)\s*\??$",
+        title.strip(),
+        re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).strip()
+
     return None
 
 
@@ -570,13 +653,11 @@ def _extract_date_from_title(title: str) -> date | None:
         re.IGNORECASE,
     )
     if not match:
-        # Try "on Inauguration Day" or other non-standard
         return None
-    
+
     month_str = match.group(1)
     day_str = match.group(2)
-    
-    # Also check for year in the event (usually not in title, inferred from endDate)
+
     for fmt in ("%B %d", "%b %d"):
         try:
             parsed = datetime.strptime(f"{month_str} {day_str}", fmt)
@@ -591,48 +672,50 @@ def parse_daily_weather_event(event: dict) -> ParsedMarket | None:
     """
     Parse a full Polymarket daily weather event (with child markets) into
     a single ParsedMarket with complete bins and outcome prices.
-    
+
     Each child market is a single Yes/No binary for one temperature bin.
     We reconstruct the full multi-bin market from all children.
+
+    The ``description`` field of the returned market is appended with a
+    ``CHILD_IDS:`` footer so that downstream PMXT enrichers can recover
+    the per-bin condition IDs without an extra API round-trip.
     """
     import json
     from weatheredge.stations import CITY_TO_STATION, get_station
-    
+
     title = event.get("title", "")
     markets = event.get("markets", [])
     description = markets[0].get("description", "") if markets else ""
-    
+
     if not markets:
         return None
-    
-    # --- Detect unit (F/C) from title and description ---
+
+    # FIX #10: detect unit once and pass it through everywhere
     unit = _detect_unit(title + " " + description)
-    
+
     # --- Extract city and resolve to station ---
     city = _extract_city_from_title(title)
     if not city:
-        log.warning(f"Could not extract city from title: {title}")
+        log.warning("Could not extract city from title: %s", title)
         return None
-    
-    # Normalize city lookup
+
     station_id = None
     for k, v in CITY_TO_STATION.items():
         if k.lower() == city.lower():
             station_id = v
             break
-    
+
     if not station_id:
-        log.warning(f"No station mapping found for city: {city}")
+        log.warning("No station mapping found for city: %s", city)
         return None
-    
-    log.info(f"Market: {title} -> Station: {station_id}, Unit: {unit}")
-    
+
+    log.info("Market: %s -> Station: %s, Unit: %s", title, station_id, unit)
+
     # --- Extract resolution date ---
-    # Prefer endDate from the event itself for year accuracy
     resolution_date = None
     child_end = markets[0].get("endDate", "") if markets else ""
-    end_date_str = event.get("endDate", "")  # keep for ParsedMarket.end_date only
-    if child_end:   
+    end_date_str = event.get("endDate", "")
+    if child_end:
         try:
             resolution_date = datetime.fromisoformat(
                 child_end.replace("Z", "+00:00")
@@ -641,6 +724,7 @@ def parse_daily_weather_event(event: dict) -> ParsedMarket | None:
             resolution_date = _extract_date_from_title(title)
     else:
         resolution_date = _extract_date_from_title(title)
+
     if end_date_str:
         try:
             resolution_date = datetime.fromisoformat(
@@ -648,50 +732,45 @@ def parse_daily_weather_event(event: dict) -> ParsedMarket | None:
             ).date()
         except (ValueError, TypeError):
             pass
-    
+
     if resolution_date is None:
         resolution_date = _extract_date_from_title(title)
-    
 
-    
     # --- Build bins from child markets ---
-    # Sort by groupItemThreshold to get proper order
+    # Sort by groupItemThreshold to preserve natural bin order
     sorted_markets = sorted(
         markets,
         key=lambda m: int(m.get("groupItemThreshold", "0")),
     )
-    
+
     bins: list[tuple[float, float]] = []
-    outcome_prices: list[float] = []  # Yes price for each bin
+    outcome_prices: list[float] = []
     outcomes: list[str] = []
-    child_condition_ids: list[str] = []  # conditionId per child (for order book lookup)
-    child_token_ids: list[str] = []  # YES clobTokenId per child (PMXT market_id)
+    child_condition_ids: list[str] = []
+    child_token_ids: list[str] = []
+    # FIX #3: track winning bin and log it for diagnostics
     winning_bin: int | None = None
-    
+
     for i, m in enumerate(sorted_markets):
         group_title = m.get("groupItemTitle", "")
         outcomes.append(group_title)
-        
-        # Parse the bin boundaries from groupItemTitle
-        # Formats: "42-43°F", "44°F or higher", "33°F or below",
-        #          "14°C", "18°C or higher", "12°C or below"
+
         bin_tuple = _parse_bin_from_group_title(group_title)
         if bin_tuple is None:
             continue
-        
-        # Convert °F bins to °C if needed
+
+        # FIX #10: use already-detected unit
         if unit == "F":
             low = fahrenheit_to_celsius(bin_tuple[0]) if bin_tuple[0] != float("-inf") else float("-inf")
             high = fahrenheit_to_celsius(bin_tuple[1]) if bin_tuple[1] != float("inf") else float("inf")
             bin_tuple = (low, high)
-        
+
         bins.append(bin_tuple)
-        
-        # Collect child market IDs for PMXT order book mapping
-        child_cid = m.get("conditionId", m.get("id", ""))
+
+        # FIX #9: use unified condition ID extractor for child markets
+        child_cid = _extract_condition_id(m)
         child_condition_ids.append(child_cid)
-        
-        # clobTokenIds: first token is usually the YES token
+
         clob_raw = m.get("clobTokenIds", "")
         if isinstance(clob_raw, str):
             clob_parts = [t.strip() for t in clob_raw.split(",") if t.strip()]
@@ -700,8 +779,7 @@ def parse_daily_weather_event(event: dict) -> ParsedMarket | None:
         else:
             clob_parts = []
         child_token_ids.append(clob_parts[0] if clob_parts else child_cid)
-        
-        # Extract the Yes price for this bin
+
         prices_raw = m.get("outcomePrices", "")
         if isinstance(prices_raw, str) and prices_raw.strip().startswith("["):
             try:
@@ -713,19 +791,29 @@ def parse_daily_weather_event(event: dict) -> ParsedMarket | None:
             yes_price = float(prices_raw[0]) if prices_raw else 0.0
         else:
             yes_price = 0.0
-        
+
         outcome_prices.append(yes_price)
-        
-        # Check if this bin won (Yes price ≈ 1.0)
+
+        # FIX #3: record winning bin and log it
         if yes_price >= 0.8:
             winning_bin = i
-    
+
     if not bins:
         return None
-    
-    # Build the ParsedMarket — token_ids stores child clobTokenIds for order book
-    # mapping.  child_condition_ids are stored as a comma-joined string in the
-    # description footer so the PMXT enricher can recover them.
+
+    if winning_bin is not None:
+        log.info(
+            "Market '%s' appears resolved: winning bin index=%d (%s)",
+            title,
+            winning_bin,
+            outcomes[winning_bin] if winning_bin < len(outcomes) else "?",
+        )
+
+    # FIX #2: append child condition IDs to description so PMXT enrichers
+    # can recover them without an extra API round-trip.
+    child_ids_footer = "\nCHILD_IDS:" + ",".join(child_condition_ids) if child_condition_ids else ""
+    full_description = description + child_ids_footer
+
     market = ParsedMarket(
         condition_id=event.get("id", ""),
         question=title,
@@ -734,59 +822,61 @@ def parse_daily_weather_event(event: dict) -> ParsedMarket | None:
         token_ids=child_token_ids,
         volume=float(event.get("volume", 0) or 0),
         end_date=end_date_str,
-        description=markets[0].get("description", "") if markets else "",
+        description=full_description,
     )
-    
+
     market.station_id = station_id
     market.metric = "tmax"
     market.bins = bins
     market.timezone = None
     market.resolution_date = resolution_date
-    
+
     return market
 
 
 def _parse_bin_from_group_title(title: str) -> tuple[float, float] | None:
     """
     Parse a temperature bin from a Polymarket groupItemTitle.
-    
+
     Examples:
-        "42-43°F" -> (42, 43)
-        "44°F or higher" -> (44, inf)
-        "33°F or below" -> (-inf, 33)
-        "14°C" -> (14, 14)  (single degree bin)
-        "-5°C" -> (-5, -5)
+        "42-43°F"           -> (42, 43)
+        "44°F or higher"    -> (44, inf)
+        "33°F or below"     -> (-inf, 33)
+        "14°C"              -> (14, 15)   FIX #6: 1-degree-wide bin, not zero-width
+        "-5°C"              -> (-5, -4)
     """
     title = title.strip()
-    
+
     # "X or higher" / "X°F or higher"
     m = re.match(r"(-?[\d.]+)\s*°?[FCfc]?\s+or\s+higher", title, re.IGNORECASE)
     if m:
         return (float(m.group(1)), float("inf"))
-    
+
     # "X or below" / "X°F or below"
     m = re.match(r"(-?[\d.]+)\s*°?[FCfc]?\s+or\s+below", title, re.IGNORECASE)
     if m:
         return (float("-inf"), float(m.group(1)))
-    
+
     # "X-Y" range (with optional °F/°C)
     m = re.match(r"(-?[\d.]+)\s*[-–]\s*(-?[\d.]+)\s*°?[FCfc]?", title)
     if m:
         return (float(m.group(1)), float(m.group(2)))
-    
+
     # "<X" / "< X"
     m = re.match(r"<\s*(-?[\d.]+)", title)
     if m:
         return (float("-inf"), float(m.group(1)))
-    
+
     # ">X" / "> X"
     m = re.match(r">\s*(-?[\d.]+)", title)
     if m:
         return (float(m.group(1)), float("inf"))
-    
-    # Single degree: "14°C" or "-5°C"
+
+    # FIX #6: Single degree "14°C" or "-5°C" — use a 1-degree-wide bin
+    # so the interval is non-degenerate and will match real temperature values.
     m = re.match(r"(-?[\d.]+)\s*°[FCfc]?$", title)
     if m:
-        return (float(m.group(1)), float(m.group(1)))
-    
+        lo = float(m.group(1))
+        return (lo, lo + 1.0)
+
     return None
