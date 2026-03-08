@@ -7,20 +7,20 @@ GAMMA_BASE = "https://gamma-api.polymarket.com"
 TITLE_SUBSTRING = "highest temperature in".lower()
 
 
-def fetch_all_events_paginated(batch_size: int = 100, max_pages: int = 30) -> List[dict]:
-    """Paginate /events with your working params."""
+def fetch_all_events_paginated(batch_size: int = 100, max_pages: int = 60) -> List[dict]:
+    """Paginate /events — weather markets appear deep in the list (~offset 3000-5000)."""
     events = []
     offset = 0
 
-    timeout = httpx.Timeout(20.0, connect=60.0)
+    timeout = httpx.Timeout(30.0, connect=60.0)
     
     with httpx.Client(timeout=timeout, verify=False) as client:
         while offset // batch_size < max_pages:
             params = {
-                "active": "true",
-                "closed": "false",
                 "limit": batch_size,
                 "offset": offset,
+                # Don't filter active/closed at event level — weather events 
+                # show active=true even when some child markets are closed
             }
             
             r = client.get(f"{GAMMA_BASE}/events", params=params)
