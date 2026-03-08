@@ -66,6 +66,24 @@ WEATHER_KEYWORDS: list[str] = [
     "fahrenheit",
 ]
 
+# Targeted series slugs for high-priority discovery
+WEATHER_SERIES_SLUGS: list[str] = [
+    "seattle-daily-weather",
+    "new-york-daily-weather",
+    "los-angeles-daily-weather",
+    "chicago-daily-weather",
+    "miami-daily-weather",
+    "daily-weather",
+    "temperature-daily",
+]
+
+# Tag slugs for categorical discovery
+WEATHER_TAG_SLUGS: list[str] = [
+    "weather",
+    "temperature",
+    "daily-temperature",
+]
+
 # Blocklist — if ANY of these appear in the market text, reject it even if
 # a weather keyword matched.  Prevents false-positives like "political
 # climate", "heated debate", "cold war", "crypto winter", etc.

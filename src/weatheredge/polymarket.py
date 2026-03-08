@@ -5,7 +5,7 @@ and parse resolution rules from description text.
 
 from __future__ import annotations
 
-import logging  # FIX #1: removed duplicate import
+import logging
 import re
 from datetime import date, datetime
 from typing import Any
@@ -20,13 +20,14 @@ from weatheredge.config import (
     POLYMARKET_GAMMA_BASE,
     NON_WEATHER_BLOCKLIST,
     WEATHER_KEYWORDS,
+    WEATHER_SERIES_SLUGS,
+    WEATHER_TAG_SLUGS,
     VERIFY_SSL,
 )
 from weatheredge.models import ParsedMarket
 
 _SUBDIR = "polymarket_cache"
 
-# Additional keywords for global climate anomaly markets
 CLIMATE_KEYWORDS = ["temperature increase", "hottest on record", "hottest month", "hottest year"]
 
 
@@ -57,15 +58,7 @@ async def _fetch_clob_token_ids(condition_id: str) -> list[str]:
     Look up the real CLOB token IDs for a market using its condition ID.
 
     The Gamma API sometimes returns empty ``clobTokenIds`` for child markets.
-    Falling back to the condition ID as a subscription key is wrong — the
-    CLOB WebSocket uses token IDs (one per outcome), not condition IDs.
-
-    ``GET /markets?condition_id=<id>`` returns a list of market dicts each
-    with a ``tokens`` array.  We collect the ``token_id`` from every token
-    across all matching markets.
-
-    Results are cached for 1 hour since token IDs never change for a given
-    condition.
+    Results are cached for 1 hour since token IDs never change.
     """
     ck = _cache_key("clob_tokens", condition_id)
     cached = read_cache(_SUBDIR, ck, max_age_hours=60)
@@ -86,8 +79,6 @@ async def _fetch_clob_token_ids(condition_id: str) -> list[str]:
 
         token_ids: list[str] = []
         for market in data:
-            # Skip markets with no active order book — the WebSocket will
-            # never send events for these regardless of token ID correctness.
             if not market.get("enable_order_book", True):
                 log.debug(
                     "CLOB enrichment: skipping market within condition %s "
@@ -121,26 +112,12 @@ async def _fetch_clob_token_ids(condition_id: str) -> list[str]:
 
 
 def _looks_like_condition_id(tid: str) -> bool:
-    """
-    Return True if ``tid`` looks like a condition ID rather than a real
-    CLOB token ID.
-
-    Polymarket token IDs are large decimal integers as strings, e.g.:
-        "71321045679452639895493894848938929495..."
-    Condition IDs are 0x-prefixed hex strings, e.g.:
-        "0x3f7d2c1a..."
-
-    When Gamma's ``clobTokenIds`` is empty and the code falls back to using
-    the condition ID as a token ID, the subscription silently fails because
-    the CLOB WebSocket does not recognise condition IDs as valid token keys.
-    """
+    """Return True if ``tid`` looks like a condition ID rather than a real CLOB token ID."""
     tid = tid.strip()
     if not tid:
         return True
-    # Condition IDs are always 0x-prefixed hex
     if tid.startswith("0x"):
         return True
-    # Real token IDs are all digits (very large integers)
     if not tid.isdigit():
         return True
     return False
@@ -151,14 +128,6 @@ async def _enrich_missing_token_ids(markets: list[ParsedMarket]) -> None:
     For every market whose ``token_ids`` appear to contain condition IDs
     rather than real CLOB token IDs, fetch the correct token IDs from the
     CLOB API and replace them in-place.
-
-    A token ID is identified as a probable condition ID (and therefore
-    wrong) when it matches the market's own ``condition_id`` — i.e. the
-    Gamma fallback path was taken during parsing.
-
-    This is the fix for the 7/9 zero-price issue: without correct token IDs
-    the WebSocket subscription is silently ignored by the CLOB server and
-    no orderbook events are ever delivered.
     """
     import asyncio
 
@@ -177,23 +146,17 @@ async def _enrich_missing_token_ids(markets: list[ParsedMarket]) -> None:
     )
 
     async def _enrich_one(market: ParsedMarket) -> None:
-        # For event-based markets (daily weather) the token_ids list stores
-        # per-bin child token IDs. We need to enrich each child individually
-        # using the condition_id stored in the CHILD_IDS footer of description.
         child_ids = _extract_child_ids_from_description(market.description)
 
         if child_ids:
-            # Fetch token IDs for every child condition and flatten
             results = await asyncio.gather(
                 *[_fetch_clob_token_ids(cid) for cid in child_ids],
                 return_exceptions=True,
             )
             new_token_ids: list[str] = []
             for r in results:
-                if isinstance(r, list):
-                    # Take only the YES token (index 0) per child market
-                    if r:
-                        new_token_ids.append(r[0])
+                if isinstance(r, list) and r:
+                    new_token_ids.append(r[0])
             if new_token_ids:
                 market.token_ids = new_token_ids
                 log.info(
@@ -201,7 +164,6 @@ async def _enrich_missing_token_ids(markets: list[ParsedMarket]) -> None:
                     market.condition_id, len(new_token_ids),
                 )
         else:
-            # Single-outcome market — look up by the market's own condition ID
             token_ids = await _fetch_clob_token_ids(market.condition_id)
             if token_ids:
                 market.token_ids = token_ids
@@ -214,12 +176,7 @@ async def _enrich_missing_token_ids(markets: list[ParsedMarket]) -> None:
 
 
 def _extract_child_ids_from_description(description: str) -> list[str]:
-    """
-    Extract child condition IDs from the ``CHILD_IDS:`` footer appended by
-    ``parse_daily_weather_event``.
-
-    Returns an empty list if no footer is present.
-    """
+    """Extract child condition IDs from the ``CHILD_IDS:`` footer."""
     match = re.search(r"CHILD_IDS:([^\n]+)", description or "")
     if not match:
         return []
@@ -234,90 +191,144 @@ async def fetch_weather_markets(
     *,
     max_pages: int = 50,
     page_size: int = 100,
+    deep_scan: bool = False,
 ) -> list[ParsedMarket]:
     """
-    Fetch active weather markets from both the Gamma ``/markets`` and
-    ``/events`` endpoints, merge and de-duplicate.
+    Fetch active weather markets from Polymarket using multiple targeted
+    strategies, and optionally an exhaustive deep scan.
 
-    The ``/events`` endpoint returns parent events with child markets
-    (one per temperature bin), which is the format Polymarket uses for
-    daily weather markets.  The ``/markets`` endpoint returns individual
-    child markets that may lack the parent context needed for station
-    matching.
+    Strategies:
+    1. Series-based (e.g. "seattle-daily-weather")
+    2. Tag-based (e.g. "weather", "temperature")
+    3. Keyword-based (e.g. "highest temperature")
+    4. Deep scan (optional, brute-forces the /events catalog)
 
-    Event-based results take priority during de-duplication since they
-    carry richer metadata (city, bins, station mapping).
+    Results are de-duplicated by condition_id.
+
+    FIX: Strategies 1 and 2 now sort by endDate descending with limit=100
+    so today's/tomorrow's markets appear first instead of 2021 resolved
+    markets that share the same series or tag slug.
     """
-    # --- Fetch from /events first (higher quality data) ---
-    event_markets = await fetch_weather_events(max_pages=max_pages, page_size=page_size)
-    seen_ids: set[str] = {m.condition_id for m in event_markets}
-    log.info("Fetched %d markets from /events endpoint", len(event_markets))
+    import asyncio
 
-    # --- Fetch from /markets as fallback ---
-    market_markets: list[ParsedMarket] = []
-    offset = 0
+    all_markets: list[ParsedMarket] = []
+    seen_ids: set[str] = set()
 
-    for _ in range(max_pages):
-        ck = _cache_key("markets", str(offset), str(page_size))
-        cached = read_cache(_SUBDIR, ck, max_age_hours=5/60)  # 5 min TTL
-        if cached is not None:
-            data = cached
-        else:
-            url = f"{POLYMARKET_GAMMA_BASE}/markets"
-            params = {
-                "limit": page_size,
-                "offset": offset,
-                "active": "true",
-                "closed": "false",
-            }
-            data = await _get_json(url, params)
-            if data:
-                write_cache(_SUBDIR, ck, data)
+    def _add_markets(new_markets: list[ParsedMarket]):
+        for m in new_markets:
+            if m.condition_id not in seen_ids:
+                all_markets.append(m)
+                seen_ids.add(m.condition_id)
 
-        if not data:
-            break
+    # --- Strategy 1: Series Slugs ---
+    log.info("Discovery: Fetching by series slugs: %s", WEATHER_SERIES_SLUGS)
+    series_tasks = [
+        _fetch_gamma_events(params={
+            "seriesSlug": slug,
+            "active": "true",
+            "order": "endDate",
+            "ascending": "false",
+            "limit": "100",
+        })
+        for slug in WEATHER_SERIES_SLUGS
+    ]
+    series_results = await asyncio.gather(*series_tasks, return_exceptions=True)
+    for res in series_results:
+        if isinstance(res, list):
+            _add_markets(res)
 
-        for item in data:
-            if _is_weather_market(item):
-                parsed = _raw_to_parsed_market(item)
-                if parsed is not None and parsed.condition_id not in seen_ids:
-                    market_markets.append(parsed)
-                    seen_ids.add(parsed.condition_id)
+    # --- Strategy 2: Tag-based Discovery ---
+    log.info("Discovery: Fetching by tag slugs: %s", WEATHER_TAG_SLUGS)
+    tag_tasks = [
+        _fetch_gamma_events(params={
+            "tag_slug": slug,
+            "active": "true",
+            "order": "endDate",
+            "ascending": "false",
+            "limit": "100",
+        })
+        for slug in WEATHER_TAG_SLUGS
+    ]
+    tag_results = await asyncio.gather(*tag_tasks, return_exceptions=True)
+    for res in tag_results:
+        if isinstance(res, list):
+            _add_markets(res)
 
-        if len(data) < page_size:
-            break
-        offset += page_size
+    # --- Strategy 3: Keyword-based Discovery (/markets) ---
+    search_keywords = ["highest temperature in", "lowest temperature in", "weather in"]
+    log.info("Discovery: Fetching by keywords: %s", search_keywords)
+    keyword_tasks = [
+        _fetch_gamma_markets(params={"keyword": kw, "active": "true", "closed": "false"})
+        for kw in search_keywords
+    ]
+    keyword_results = await asyncio.gather(*keyword_tasks, return_exceptions=True)
+    for res in keyword_results:
+        if isinstance(res, list):
+            _add_markets(res)
 
-    log.info("Fetched %d additional markets from /markets endpoint", len(market_markets))
-    all_markets = event_markets + market_markets
+    # --- Strategy 4: Deep Scan (Optional Fallback) ---
+    if deep_scan:
+        log.warning("Discovery: Performing exhaustive deep scan (brute-force /events)")
+        deep_markets = await fetch_weather_events(max_pages=max_pages, page_size=page_size)
+        _add_markets(deep_markets)
 
-    # Enrich any markets where Gamma returned empty clobTokenIds — without
-    # real token IDs the WebSocket subscription is silent and all prices
-    # will be zero.
+    log.info("Discovery phase complete: found %d total markets", len(all_markets))
+
     await _enrich_missing_token_ids(all_markets)
 
     return all_markets
 
 
+async def _fetch_gamma_events(params: dict) -> list[ParsedMarket]:
+    """Helper to fetch and parse events from /events with given params."""
+    try:
+        data = await _get_json(f"{POLYMARKET_GAMMA_BASE}/events", params)
+        if not data or not isinstance(data, list):
+            return []
+        markets = []
+        for event in data:
+            parsed = parse_daily_weather_event(event)
+            if parsed:
+                markets.append(parsed)
+        return markets
+    except Exception as e:
+        log.debug("Gamma targeted event fetch failed (%s): %s", params, e)
+        return []
+
+
+async def _fetch_gamma_markets(params: dict) -> list[ParsedMarket]:
+    """Helper to fetch and parse markets from /markets with given params."""
+    try:
+        data = await _get_json(f"{POLYMARKET_GAMMA_BASE}/markets", params)
+        if not data or not isinstance(data, list):
+            return []
+        markets = []
+        for item in data:
+            if _is_weather_market(item):
+                parsed = _raw_to_parsed_market(item)
+                if parsed:
+                    markets.append(parsed)
+        return markets
+    except Exception as e:
+        log.debug("Gamma targeted market fetch failed (%s): %s", params, e)
+        return []
+
+
 async def fetch_weather_events(
     *,
-    max_pages: int = 50,
+    max_pages: int = 60,
     page_size: int = 100,
 ) -> list[ParsedMarket]:
     """
     Fetch active daily weather events from Gamma ``GET /events``.
-
-    Daily weather markets on Polymarket are structured as events with
-    child markets (one per temperature bin).  This function fetches the
-    parent events, filters for daily weather markets, and parses them
-    using :func:`parse_daily_weather_event`.
+    Paginates deep into the catalog to find events missing from standard filters.
     """
     markets: list[ParsedMarket] = []
     offset = 0
 
     for _ in range(max_pages):
         ck = _cache_key("events", str(offset), str(page_size))
-        cached = read_cache(_SUBDIR, ck, max_age_hours=5/60)  # 5 min TTL
+        cached = read_cache(_SUBDIR, ck, max_age_hours=5/60)
         if cached is not None:
             data = cached
         else:
@@ -342,9 +353,23 @@ async def fetch_weather_events(
 
         for event in data:
             title = event.get("title", "").lower()
-            # Filter for daily weather events
             if "highest temperature in" not in title and "temperature" not in title:
                 continue
+
+            # FIX: The /events list object often lacks the complete 'markets' 
+            # array needed for bin parsing. Fetch the full event details 
+            # or markets for this event ID to be safe.
+            event_id = event.get("id")
+            if event_id:
+                try:
+                    full_markets = await _get_json(
+                        f"{POLYMARKET_GAMMA_BASE}/markets",
+                        params={"eventId": event_id, "active": "true", "closed": "false"}
+                    )
+                    if full_markets:
+                        event["markets"] = full_markets
+                except Exception as e:
+                    log.debug("Failed to fetch markets for event %s: %s", event_id, e)
 
             parsed = parse_daily_weather_event(event)
             if parsed is not None:
@@ -359,27 +384,18 @@ async def fetch_weather_events(
 
 
 def _is_weather_market(item: dict) -> bool:
-    """Return True if the market looks like a weather market.
-
-    Rejects markets that match non-weather blocklist terms (politics,
-    crypto, sports, etc.) even if a weather keyword happens to appear.
-    """
+    """Return True if the market looks like a weather market."""
     searchable = " ".join([
         item.get("question", ""),
         item.get("description", ""),
         " ".join(item.get("tags", []) if isinstance(item.get("tags"), list) else []),
     ]).lower()
 
-    # Reject non-weather markets first
     if any(bl in searchable for bl in NON_WEATHER_BLOCKLIST):
         return False
 
-    # Check for keywords
     for kw in WEATHER_KEYWORDS + CLIMATE_KEYWORDS:
         if kw in searchable:
-            # For short or common words, require word boundaries to avoid
-            # false positives like "ukraine" matching "rain" or "wind"
-            # in names.
             if kw in ("rain", "temp", "wind", "ice", "cold", "heat"):
                 if not re.search(rf"\b{kw}\b", searchable):
                     continue
@@ -389,13 +405,7 @@ def _is_weather_market(item: dict) -> bool:
 
 
 def _extract_condition_id(item: dict) -> str:
-    """
-    FIX #9: Consistently extract a condition/market ID from a raw API dict.
-
-    Polymarket's Gamma API uses ``conditionId`` for CLOB-linked markets and
-    ``id`` as a fallback UUID.  Always prefer ``conditionId`` when present and
-    non-empty, as it is the canonical identifier used by the CLOB and PMXT.
-    """
+    """Consistently extract a condition/market ID from a raw API dict."""
     cid = item.get("conditionId", "").strip()
     if cid:
         return cid
@@ -404,6 +414,9 @@ def _extract_condition_id(item: dict) -> str:
 
 def _raw_to_parsed_market(item: dict) -> ParsedMarket | None:
     """Convert a raw Gamma API market dict to our ParsedMarket dataclass."""
+    if not item.get("active", True) or item.get("closed", False):
+        return None
+
     try:
         import json
         outcomes = item.get("outcomes", "")
@@ -431,13 +444,11 @@ def _raw_to_parsed_market(item: dict) -> ParsedMarket | None:
         else:
             outcome_prices = []
 
-        # Token IDs may come from clobTokenIds
         token_ids_raw = item.get("clobTokenIds", "")
         if isinstance(token_ids_raw, str):
             if token_ids_raw.strip().startswith("["):
                 try:
-                    token_ids = json.loads(token_ids_raw)
-                    token_ids = [str(t) for t in token_ids]
+                    token_ids = [str(t) for t in json.loads(token_ids_raw)]
                 except json.JSONDecodeError:
                     token_ids = [t.strip() for t in token_ids_raw.split(",") if t.strip()]
             else:
@@ -450,7 +461,6 @@ def _raw_to_parsed_market(item: dict) -> ParsedMarket | None:
         description = item.get("description", "")
         question = item.get("question", "")
 
-        # FIX #9: use unified condition ID extractor
         market = ParsedMarket(
             condition_id=_extract_condition_id(item),
             question=question,
@@ -462,11 +472,9 @@ def _raw_to_parsed_market(item: dict) -> ParsedMarket | None:
             description=description,
         )
 
-        # FIX #10: detect unit once here; pass it into parse_resolution_rules
         group_title = item.get("groupItemTitle", "")
         detected_unit = _detect_unit(question + " " + description + " " + group_title)
 
-        # Attempt to parse resolution rules from the description and title
         parsed = parse_resolution_rules(
             description, question, group_title, outcomes, detected_unit=detected_unit
         )
@@ -476,7 +484,6 @@ def _raw_to_parsed_market(item: dict) -> ParsedMarket | None:
         market.timezone = parsed.get("timezone")
         market.resolution_date = parsed.get("resolution_date")
 
-        # --- City-name fallback for station matching ---
         if market.station_id is None:
             from weatheredge.stations import CITY_TO_STATION
             city = _extract_city_from_title(question)
@@ -486,9 +493,6 @@ def _raw_to_parsed_market(item: dict) -> ParsedMarket | None:
                         market.station_id = v
                         break
 
-        # --- Unit Normalization ---
-        # Everything normalised to Celsius for probability.py.
-        # FIX #10: reuse the already-detected unit rather than detecting again.
         from weatheredge.stations import get_station
         station = get_station(market.station_id) if market.station_id else None
         market_unit = station.preferred_unit if (station and station.preferred_unit) else detected_unit
@@ -504,7 +508,6 @@ def _raw_to_parsed_market(item: dict) -> ParsedMarket | None:
 
         return market
     except Exception:
-        # FIX #4: log the exception instead of silently swallowing it
         log.exception(
             "Failed to parse market (conditionId=%r, question=%r)",
             item.get("conditionId", item.get("id", "unknown")),
@@ -517,41 +520,31 @@ def _raw_to_parsed_market(item: dict) -> ParsedMarket | None:
 # Resolution rule parsing
 # =========================================================================
 
-# Common station ID patterns found in Polymarket weather descriptions
-_STATION_PATTERN = re.compile(
-    r"\b([A-Z]{4})\b"  # ICAO 4-letter codes (NZWN, EGLL, KORD, etc.)
-)
+_STATION_PATTERN = re.compile(r"\b([A-Z]{4})\b")
 
-# Wunderground station references
 _WU_STATION_PATTERN = re.compile(
     r"(?:Weather\s+Underground|Wunderground|WU|weather\.com).*?(?:station\s+)?([A-Z]{2,5}[0-9]*[A-Z]*)",
     re.IGNORECASE,
 )
 
-# Date patterns
 _DATE_PATTERN = re.compile(
     r"(?:on|for|by)\s+(\w+\s+\d{1,2}(?:,?\s*\d{4})?)",
     re.IGNORECASE,
 )
 
-# Metric detection
 _METRIC_PATTERNS = {
     "tmax": re.compile(r"\b(?:high\s+temp|maximum\s+temp|daily\s+high|high\b)", re.IGNORECASE),
     "tmin": re.compile(r"\b(?:low\s+temp|minimum\s+temp|daily\s+low|overnight\s+low)", re.IGNORECASE),
     "precip": re.compile(r"\b(?:precip|rainfall|rain\s+total|precipitation)", re.IGNORECASE),
 }
 
-# Temperature bin patterns — e.g., "Under 18", "18-20", "20-22", "Over 24"
 _BIN_UNDER = re.compile(r"[Uu]nder\s+([\d.]+)")
 _BIN_OVER = re.compile(r"[Oo]ver\s+([\d.]+)")
-# FIX #7: require °/degree context around the range to avoid matching
-# version strings, coordinates, and other non-temperature numeric ranges.
 _BIN_RANGE = re.compile(
     r"([\d.]+)\s*[-–]\s*([\d.]+)\s*(?:°|degrees?\b)",
     re.IGNORECASE,
 )
 
-# Known ICAO codes for our priority stations — used to prioritise matches
 _KNOWN_ICAO = {"NZWN", "EGLL", "KJFK", "KNYC", "KORD", "YSSY", "YMML", "RJTT"}
 
 
@@ -561,14 +554,11 @@ def parse_resolution_rules(
     group_title: str = "",
     outcomes: list[str] | None = None,
     *,
-    detected_unit: str = "C",  # FIX #10: accept pre-detected unit to avoid double-detection
+    detected_unit: str = "C",
 ) -> dict[str, Any]:
     """
     Extract station ID, metric, bins, timezone, and date from a market's
     description and question text.
-
-    Returns a dict with keys: station_id, metric, bins, timezone, resolution_date.
-    Missing fields are None.
     """
     if outcomes is None:
         outcomes = []
@@ -582,13 +572,11 @@ def parse_resolution_rules(
         "resolution_date": None,
     }
 
-    # --- Global Climate Anomaly Check ---
     is_climate = any(kw in full_text.lower() for kw in CLIMATE_KEYWORDS)
     if is_climate:
         result["station_id"] = "GLOBAL"
-        result["metric"] = "tmax"  # Use tmax as a proxy for anomaly
+        result["metric"] = "tmax"
 
-        # Determine the target bin from groupItemTitle or question
         search_text = f"{group_title} {question}"
         target_bin = None
 
@@ -613,48 +601,36 @@ def parse_resolution_rules(
             target_bin = (float(rng.group(1)), float(rng.group(2)))
 
         if target_bin and len(outcomes) == 2 and set(o.lower() for o in outcomes) == {"yes", "no"}:
-            # Standardise Yes/No outcomes to represent the target bin.
-            # Index 0 is usually "Yes", Index 1 is "No".
             if outcomes[0].lower() == "yes":
                 result["bins"] = [target_bin, (float("-inf"), float("inf"))]
             else:
                 result["bins"] = [(float("-inf"), float("inf")), target_bin]
 
-    # --- Station ID ---
     if result["station_id"] is None:
-        # Try Wunderground reference first
         wu_match = _WU_STATION_PATTERN.search(full_text)
         if wu_match:
             result["station_id"] = wu_match.group(1).upper()
         else:
-            # Fall back to ICAO codes, preferring known stations
             icao_matches = _STATION_PATTERN.findall(full_text)
             for code in icao_matches:
                 if code in _KNOWN_ICAO:
                     result["station_id"] = code
                     break
             if result["station_id"] is None and icao_matches:
-                # Take first plausible ICAO code
                 result["station_id"] = icao_matches[0]
 
-    # --- Metric ---
     if result["metric"] is None:
         for metric_name, pattern in _METRIC_PATTERNS.items():
             if pattern.search(full_text):
                 result["metric"] = metric_name
                 break
         if result["metric"] is None:
-            # Default to tmax for temperature markets
             if re.search(r"\btemp", full_text, re.IGNORECASE):
                 result["metric"] = "tmax"
 
-    # --- Bins ---
-    # FIX #8: for regular (non-climate) markets, parse bins from outcomes when
-    # available, rather than always returning an empty list.
     if not result["bins"] and outcomes:
         parsed_bins = parse_bins_from_outcomes(outcomes)
         if parsed_bins:
-            # Convert to Celsius if the market unit is Fahrenheit
             if detected_unit == "F":
                 parsed_bins = [
                     (
@@ -665,7 +641,6 @@ def parse_resolution_rules(
                 ]
             result["bins"] = parsed_bins
 
-    # --- Timezone ---
     tz_match = re.search(
         r"\b(UTC|EST|CST|MST|PST|NZST|NZDT|AEST|AEDT|GMT|BST|JST|ET|CT|PT)\b",
         full_text,
@@ -673,16 +648,13 @@ def parse_resolution_rules(
     if tz_match:
         result["timezone"] = tz_match.group(1)
 
-    # --- Resolution date ---
     date_match = _DATE_PATTERN.search(question)
     if date_match:
         try:
             raw = date_match.group(1).strip().rstrip(",")
-            # Try common formats
             for fmt in ("%B %d %Y", "%B %d, %Y", "%B %d", "%b %d %Y", "%b %d"):
                 try:
                     parsed_date = datetime.strptime(raw, fmt).date()
-                    # If year is missing, assume current/next year
                     if parsed_date.year == 1900:
                         today = date.today()
                         parsed_date = parsed_date.replace(year=today.year)
@@ -740,7 +712,7 @@ async def fetch_midpoint_prices(token_ids: list[str]) -> dict[str, float]:
 
     sorted_ids = sorted(token_ids)
     ck = _cache_key("midpoints", *sorted_ids)
-    cached = read_cache(_SUBDIR, ck, max_age_hours=2/60)  # 2 min TTL
+    cached = read_cache(_SUBDIR, ck, max_age_hours=2/60)
     if cached is not None:
         return cached
 
@@ -770,26 +742,21 @@ def _detect_unit(text: str) -> str:
     """Detect if Fahrenheit or Celsius from text."""
     search = text.lower()
 
-    # Check for explicit phrases first
     if "degrees celsius" in search or "degrees c" in search:
         return "C"
     if "degrees fahrenheit" in search or "degrees f" in search:
         return "F"
 
-    # Check for symbols with numbers
     if re.search(r"\d+\s*°c", search) or re.search(r"\bcelsius\b", search):
         return "C"
     if re.search(r"\d+\s*°f", search) or re.search(r"\bfahrenheit\b", search):
         return "F"
 
-    # If both or neither, check for symbols
     if "°c" in search:
         return "C"
     if "°f" in search:
         return "F"
 
-    # Default to Celsius for international safety,
-    # but the calling code should prioritize station metadata.
     return "C"
 
 
@@ -798,13 +765,7 @@ def _extract_city_from_title(title: str) -> str | None:
     Extract city name from titles like:
         'Highest temperature in NYC on March 3?'
         'Will the high temperature in New York City reach 80°F?'
-
-    FIX #5: broadened regex so multi-word city names and varied phrasing
-    are handled correctly.  The previous pattern broke on cities containing
-    prepositions (e.g. "Port of Spain") and on titles that used "reach" or
-    "be" but not immediately after the city name.
     """
-    # Primary pattern: "in <city> on/be/reach/stay"
     m = re.search(
         r"\bin\s+([A-Za-z][A-Za-z\s\-\.]{1,40}?)\s+(?:on|be|reach|stay)\b",
         title,
@@ -813,7 +774,6 @@ def _extract_city_from_title(title: str) -> str | None:
     if m:
         return m.group(1).strip()
 
-    # Fallback: "in <city>?" at end of title (no action verb present)
     m = re.search(
         r"\bin\s+([A-Za-z][A-Za-z\s\-\.]{1,40}?)\s*\??$",
         title.strip(),
@@ -841,7 +801,6 @@ def _extract_date_from_title(title: str) -> date | None:
     for fmt in ("%B %d", "%b %d"):
         try:
             parsed = datetime.strptime(f"{month_str} {day_str}", fmt)
-            # Year is missing — use current year, adjust later from endDate
             return parsed.replace(year=date.today().year).date()
         except ValueError:
             continue
@@ -852,14 +811,10 @@ def parse_daily_weather_event(event: dict) -> ParsedMarket | None:
     """
     Parse a full Polymarket daily weather event (with child markets) into
     a single ParsedMarket with complete bins and outcome prices.
-
-    Each child market is a single Yes/No binary for one temperature bin.
-    We reconstruct the full multi-bin market from all children.
-
-    The ``description`` field of the returned market is appended with a
-    ``CHILD_IDS:`` footer so that downstream PMXT enrichers can recover
-    the per-bin condition IDs without an extra API round-trip.
     """
+    if not event.get("active", True) or event.get("closed", False):
+        return None
+
     import json
     from weatheredge.stations import CITY_TO_STATION, get_station
 
@@ -870,10 +825,8 @@ def parse_daily_weather_event(event: dict) -> ParsedMarket | None:
     if not markets:
         return None
 
-    # FIX #10: detect unit once and pass it through everywhere
     unit = _detect_unit(title + " " + description)
 
-    # --- Extract city and resolve to station ---
     city = _extract_city_from_title(title)
     if not city:
         log.warning("Could not extract city from title: %s", title)
@@ -891,7 +844,6 @@ def parse_daily_weather_event(event: dict) -> ParsedMarket | None:
 
     log.info("Market: %s -> Station: %s, Unit: %s", title, station_id, unit)
 
-    # --- Extract resolution date ---
     resolution_date = None
     child_end = markets[0].get("endDate", "") if markets else ""
     end_date_str = event.get("endDate", "")
@@ -916,8 +868,6 @@ def parse_daily_weather_event(event: dict) -> ParsedMarket | None:
     if resolution_date is None:
         resolution_date = _extract_date_from_title(title)
 
-    # --- Build bins from child markets ---
-    # Sort by groupItemThreshold to preserve natural bin order
     sorted_markets = sorted(
         markets,
         key=lambda m: int(m.get("groupItemThreshold", "0")),
@@ -928,7 +878,6 @@ def parse_daily_weather_event(event: dict) -> ParsedMarket | None:
     outcomes: list[str] = []
     child_condition_ids: list[str] = []
     child_token_ids: list[str] = []
-    # FIX #3: track winning bin and log it for diagnostics
     winning_bin: int | None = None
 
     for i, m in enumerate(sorted_markets):
@@ -939,7 +888,6 @@ def parse_daily_weather_event(event: dict) -> ParsedMarket | None:
         if bin_tuple is None:
             continue
 
-        # FIX #10: use already-detected unit
         if unit == "F":
             low = fahrenheit_to_celsius(bin_tuple[0]) if bin_tuple[0] != float("-inf") else float("-inf")
             high = fahrenheit_to_celsius(bin_tuple[1]) if bin_tuple[1] != float("inf") else float("inf")
@@ -947,13 +895,18 @@ def parse_daily_weather_event(event: dict) -> ParsedMarket | None:
 
         bins.append(bin_tuple)
 
-        # FIX #9: use unified condition ID extractor for child markets
         child_cid = _extract_condition_id(m)
         child_condition_ids.append(child_cid)
 
         clob_raw = m.get("clobTokenIds", "")
         if isinstance(clob_raw, str):
-            clob_parts = [t.strip() for t in clob_raw.split(",") if t.strip()]
+            if clob_raw.strip().startswith("["):
+                try:
+                    clob_parts = [str(t) for t in json.loads(clob_raw)]
+                except json.JSONDecodeError:
+                    clob_parts = [t.strip() for t in clob_raw.split(",") if t.strip()]
+            else:
+                clob_parts = [t.strip() for t in clob_raw.split(",") if t.strip()]
         elif isinstance(clob_raw, list):
             clob_parts = [str(t) for t in clob_raw]
         else:
@@ -974,7 +927,6 @@ def parse_daily_weather_event(event: dict) -> ParsedMarket | None:
 
         outcome_prices.append(yes_price)
 
-        # FIX #3: record winning bin and log it
         if yes_price >= 0.8:
             winning_bin = i
 
@@ -989,8 +941,6 @@ def parse_daily_weather_event(event: dict) -> ParsedMarket | None:
             outcomes[winning_bin] if winning_bin < len(outcomes) else "?",
         )
 
-    # FIX #2: append child condition IDs to description so PMXT enrichers
-    # can recover them without an extra API round-trip.
     child_ids_footer = "\nCHILD_IDS:" + ",".join(child_condition_ids) if child_condition_ids else ""
     full_description = description + child_ids_footer
 
@@ -1022,38 +972,31 @@ def _parse_bin_from_group_title(title: str) -> tuple[float, float] | None:
         "42-43°F"           -> (42, 43)
         "44°F or higher"    -> (44, inf)
         "33°F or below"     -> (-inf, 33)
-        "14°C"              -> (14, 15)   FIX #6: 1-degree-wide bin, not zero-width
+        "14°C"              -> (14, 15)
         "-5°C"              -> (-5, -4)
     """
     title = title.strip()
 
-    # "X or higher" / "X°F or higher"
     m = re.match(r"(-?[\d.]+)\s*°?[FCfc]?\s+or\s+higher", title, re.IGNORECASE)
     if m:
         return (float(m.group(1)), float("inf"))
 
-    # "X or below" / "X°F or below"
     m = re.match(r"(-?[\d.]+)\s*°?[FCfc]?\s+or\s+below", title, re.IGNORECASE)
     if m:
         return (float("-inf"), float(m.group(1)))
 
-    # "X-Y" range (with optional °F/°C)
     m = re.match(r"(-?[\d.]+)\s*[-–]\s*(-?[\d.]+)\s*°?[FCfc]?", title)
     if m:
         return (float(m.group(1)), float(m.group(2)))
 
-    # "<X" / "< X"
     m = re.match(r"<\s*(-?[\d.]+)", title)
     if m:
         return (float("-inf"), float(m.group(1)))
 
-    # ">X" / "> X"
     m = re.match(r">\s*(-?[\d.]+)", title)
     if m:
         return (float(m.group(1)), float("inf"))
 
-    # FIX #6: Single degree "14°C" or "-5°C" — use a 1-degree-wide bin
-    # so the interval is non-degenerate and will match real temperature values.
     m = re.match(r"(-?[\d.]+)\s*°[FCfc]?$", title)
     if m:
         lo = float(m.group(1))

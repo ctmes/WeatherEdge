@@ -86,6 +86,10 @@ def main() -> None:
     )
 
     scan_parser.add_argument(
+        "--deep-scan", action="store_true", help="Perform exhaustive brute-force event scan",
+    )
+
+    scan_parser.add_argument(
 
         "-v", "--verbose", action="store_true", help="Enable debug logging",
 
@@ -105,6 +109,10 @@ def main() -> None:
 
         "--bankroll", type=float, default=10_000.0,
 
+    )
+
+    diag_parser.add_argument(
+        "--deep-scan", action="store_true", help="Perform exhaustive brute-force event scan",
     )
 
     diag_parser.add_argument(
@@ -176,6 +184,10 @@ def main() -> None:
 
         help="Run a single scan-and-log cycle then exit",
 
+    )
+
+    run_parser.add_argument(
+        "--deep-scan", action="store_true", help="Perform exhaustive brute-force event scan",
     )
 
     run_parser.add_argument(
@@ -407,7 +419,10 @@ def main() -> None:
 
 def _run_scan(args: argparse.Namespace) -> None:
 
-    signals, _ = asyncio.run(run_scan(bankroll=args.bankroll))
+    signals, _ = asyncio.run(run_scan(
+        bankroll=args.bankroll,
+        deep_scan=args.deep_scan,
+    ))
 
 
 
@@ -436,9 +451,11 @@ def _run_scan(args: argparse.Namespace) -> None:
 def _run_diagnose(args: argparse.Namespace) -> None:
 
     signals, diag = asyncio.run(
-
-        run_scan(bankroll=args.bankroll, diagnostics=True)
-
+        run_scan(
+            bankroll=args.bankroll,
+            diagnostics=True,
+            deep_scan=args.deep_scan,
+        )
     )
 
 

@@ -15,7 +15,7 @@ from weatheredge.calibration import StationBias, apply_calibration, apply_calibr
 from weatheredge.config import TRADING
 from weatheredge.forecast import AtmosphericRegime, fetch_forecast, fetch_regime_data
 from weatheredge.models import EdgeSignal, ForecastResult, ParsedMarket
-from weatheredge.polymarket import fetch_weather_markets, parse_bins_from_outcomes
+from weatheredge.polymarket import fetch_weather_markets, parse_bins_from_outcomes, fetch_midpoint_prices
 from weatheredge.probability import (
     StaleMarketPricesError,
     calculate_edge,
@@ -67,6 +67,7 @@ async def run_scan(
     calibrations: dict[str, StationBias] | None = None,
     diagnostics: bool = False,
     orderbooks: dict[str, OrderbookSnapshot] | None = None,
+    deep_scan: bool = False,
 ) -> tuple[list[EdgeSignal], ScanDiagnostics | None]:
     """
     Execute one full pipeline scan with calibration and regime checks.
@@ -77,9 +78,9 @@ async def run_scan(
     diag = ScanDiagnostics() if diagnostics else None
     calibrations = calibrations or {}
 
-    logger.info("Starting scan...")
+    logger.info("Starting scan (deep_scan=%s)...", deep_scan)
 
-    markets = await fetch_weather_markets()
+    markets = await fetch_weather_markets(deep_scan=deep_scan)
     if diag:
         diag.weather_markets_found = len(markets)
     logger.info("Found %d weather markets on Polymarket", len(markets))
@@ -111,6 +112,21 @@ async def run_scan(
         "Matched %d markets to %d stations (%d unmatched)",
         matched_count, len(station_markets), len(unmatched_markets),
     )
+
+    # FIX: Fetch live CLOB midpoints if no orderbooks provided
+    if orderbooks is None:
+        all_token_ids = []
+        for m_list in station_markets.values():
+            for m in m_list:
+                all_token_ids.extend(m.token_ids)
+        
+        if all_token_ids:
+            logger.info("Fetching live CLOB prices for %d tokens...", len(all_token_ids))
+            midpoints = await fetch_midpoint_prices(all_token_ids)
+            if midpoints:
+                # Convert to the format expected by _resolve_market_price
+                orderbooks = {tid: {"mid": price, "bids": [], "asks": []} for tid, price in midpoints.items()}
+                logger.info("Successfully enriched scan with %d CLOB midpoints", len(midpoints))
 
     for m in unmatched_markets[:5]:
         logger.debug("Unmatched: %s (station_id=%s)", m.question[:60], m.station_id)
@@ -246,13 +262,17 @@ def _resolve_market_price(
 
     if isinstance(book, dict):
         integrity = check_midpoint_integrity(book.get("bids"), book.get("asks"))
+        # Use provided 'mid' or calculate from levels
+        mid = book.get("mid")
+        if mid is None:
+            mid = (
+                (book["bids"][0][0] + book["asks"][0][0]) / 2
+                if book.get("bids") and book.get("asks")
+                else gamma_price
+            )
+        
         asks = book.get("asks") or []
         depth_usd = sum(a[0] * a[1] for a in asks if len(a) >= 2)
-        mid = (
-            (book["bids"][0][0] + book["asks"][0][0]) / 2
-            if book.get("bids") and book.get("asks")
-            else gamma_price
-        )
         return mid, integrity["multiplier"], depth_usd
 
     return gamma_price, no_book_multiplier, 0.0
