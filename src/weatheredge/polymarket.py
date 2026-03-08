@@ -75,14 +75,26 @@ async def _fetch_clob_token_ids(condition_id: str) -> list[str]:
     url = f"{POLYMARKET_CLOB_BASE}/markets"
     try:
         data = await _get_json(url, {"condition_id": condition_id})
-        # Response may be a single dict or a list
-        if isinstance(data, dict):
+
+        # Unwrap paginated envelope — CLOB returns {"data": [...], "next_cursor": ...}
+        if isinstance(data, dict) and "data" in data:
+            data = data["data"]
+        elif isinstance(data, dict):
             data = [data]
         if not isinstance(data, list) or not data:
             return []
 
         token_ids: list[str] = []
         for market in data:
+            # Skip markets with no active order book — the WebSocket will
+            # never send events for these regardless of token ID correctness.
+            if not market.get("enable_order_book", True):
+                log.debug(
+                    "CLOB enrichment: skipping market within condition %s "
+                    "— order book disabled (closed/resolved market)",
+                    condition_id,
+                )
+                continue
             for token in market.get("tokens", []):
                 tid = str(token.get("token_id", "")).strip()
                 if tid:
