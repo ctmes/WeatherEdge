@@ -121,9 +121,20 @@ async def run_scan(
         matched_count, len(station_markets), len(unmatched_markets),
     )
 
-    # Log unmatched for debugging
-    for m in unmatched_markets[:5]:
-        logger.debug("Unmatched: %s (station_id=%s)", m.question[:60], m.station_id)
+    # Warn about unmatched markets — this is operationally significant
+    if unmatched_markets:
+        sample = ", ".join(
+            f"'{m.question[:45]}' (parsed_id={m.station_id!r})"
+            for m in unmatched_markets[:3]
+        )
+        logger.info(
+            "%d/%d markets have no matching station and will be skipped. "
+            "Sample: %s%s",
+            len(unmatched_markets),
+            len(markets),
+            sample,
+            " ..." if len(unmatched_markets) > 3 else "",
+        )
 
     # ── 4. Fetch forecasts + regime data ──────────────────────────────
     forecasts: dict[str, list[ForecastResult]] = {}
@@ -323,12 +334,39 @@ def _process_market(
         TRADING.min_edge_threshold, regime_assessment
     )
 
+    # Identify bins with no raw price data before normalization.
+    # A raw price of 0.0 means PMXT enrichment failed — it is NOT a genuine
+    # near-zero probability.  Trading these bins creates phantom edge.
+    zero_price_bins: set[int] = {
+        i for i, p in enumerate(market.outcome_prices) if p < 1e-6
+    }
+    if zero_price_bins:
+        logger.warning(
+            "Market %s: %d/%d bins have zero raw prices (PMXT enrichment likely "
+            "failed for indices %s) — skipping those bins.",
+            market.condition_id,
+            len(zero_price_bins),
+            len(market.outcome_prices),
+            sorted(zero_price_bins),
+        )
+
     # Estimate dynamic slippage based on market volume
     from weatheredge.slippage import estimate_slippage
 
     signals: list[EdgeSignal] = []
     for i, (mp, mkt_p) in enumerate(zip(model_probs, market_probs)):
         detail["bins_evaluated"] += 1
+
+        # Skip bins with missing price data (raw zero = no orderbook data)
+        if i in zero_price_bins:
+            continue
+
+        # Skip the all-inclusive (-inf, +inf) sentinel bin used as the "No" side
+        # in YES/NO binary markets.  Its model probability is always ~1.0, which
+        # creates a phantom huge edge against the No side.
+        if bins[i] == (float("-inf"), float("inf")):
+            logger.debug("Skipping all-range bin %d in market %s (YES/NO No-side)", i, market.condition_id)
+            continue
 
         # First pass: estimate edge with a preliminary slippage to check threshold
         preliminary_slip = estimate_slippage(
@@ -366,17 +404,11 @@ def _process_market(
         # Apply regime + integrity multipliers
         combined_multiplier = regime_assessment.confidence_multiplier * integrity_multiplier
 
-        # -- Safety: Avoid 0% market probability bins -----------------
-        # This usually indicates a resolved market or bad data.
-        if mkt_p <= 0.001:
-            logger.debug("Skipping bin %d: market probability too low (%.4f)", i, mkt_p)
-            continue
-
         # Apply regime confidence multiplier to sizing
         if edge >= edge_threshold and combined_multiplier > 0:
             adjusted_edge = edge * combined_multiplier
-            kf = kelly_fraction(adjusted_edge)
-            bet = recommended_bet_usd(adjusted_edge, bankroll)
+            kf = kelly_fraction(adjusted_edge, odds=(1.0 - mkt_p))
+            bet = recommended_bet_usd(adjusted_edge, bankroll, odds=(1.0 - mkt_p))
 
             # Cap bet to max allowed (3% per config/safety)
             if bet > bankroll * 0.03:
@@ -395,8 +427,8 @@ def _process_market(
                 continue
 
             adjusted_edge = refined_edge * combined_multiplier
-            kf = kelly_fraction(adjusted_edge)
-            bet = recommended_bet_usd(adjusted_edge, bankroll)
+            kf = kelly_fraction(adjusted_edge, odds=(1.0 - mkt_p))
+            bet = recommended_bet_usd(adjusted_edge, bankroll, odds=(1.0 - mkt_p))
             if bet > bankroll * 0.03:
                 bet = bankroll * 0.03
 

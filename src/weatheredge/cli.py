@@ -944,7 +944,7 @@ def _export_backtest_report(run_id: int, path: str) -> None:
 
     conn = sqlite3.connect(db_path)
 
-    df = pd.read_sql_query(f"""
+    df = pd.read_sql_query("""
 
         SELECT
 
@@ -978,11 +978,11 @@ def _export_backtest_report(run_id: int, path: str) -> None:
 
         LEFT JOIN results r ON r.signal_id = s.id
 
-        WHERE s.backtest_run_id = {run_id}
+        WHERE s.backtest_run_id = ?
 
         ORDER BY s.created_at
 
-    """, conn)
+    """, conn, params=(run_id,))
 
     conn.close()
 

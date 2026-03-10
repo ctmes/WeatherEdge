@@ -176,25 +176,28 @@ def main() -> None:
         f"{tf}  ·  {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
     )
 
-    time_filter = f"AND r.resolved_at >= '{cutoff}'" if cutoff else ""
-    signal_filter = f"AND s.created_at >= '{cutoff}'" if cutoff else ""
-
     # ── Metrics ───────────────────────────────────────────────────
-    results_df = _query(f"""
+    results_df = _query(
+        """
         SELECT
             COUNT(*) as n,
             SUM(CASE WHEN r.won THEN 1 ELSE 0 END) as wins,
             SUM(r.pnl_usd) as total_pnl
         FROM results r
         JOIN signals s ON r.signal_id = s.id
-        WHERE 1=1 {time_filter}
-    """)
+        WHERE (? IS NULL OR r.resolved_at >= ?)
+        """,
+        (cutoff, cutoff),
+    )
 
-    brier_df = _query(f"""
+    brier_df = _query(
+        """
         SELECT AVG(brier_score) as avg_brier, AVG(baseline_brier) as avg_baseline
         FROM brier_scores
-        WHERE 1=1 {"AND calculated_at >= '" + cutoff + "'" if cutoff else ""}
-    """)
+        WHERE (? IS NULL OR calculated_at >= ?)
+        """,
+        (cutoff, cutoff),
+    )
 
     n = int(results_df.iloc[0]["n"]) if len(results_df) and results_df.iloc[0]["n"] else 0
     wins = int(results_df.iloc[0]["wins"] or 0) if n else 0
@@ -241,14 +244,17 @@ def main() -> None:
     st.divider()
     st.markdown("### Equity Curve")
 
-    equity_df = _query(f"""
+    equity_df = _query(
+        """
         SELECT r.resolved_at,
                SUM(r.pnl_usd) OVER (ORDER BY r.resolved_at) as cumulative_pnl
         FROM results r
         JOIN signals s ON r.signal_id = s.id
-        WHERE 1=1 {time_filter}
+        WHERE (? IS NULL OR r.resolved_at >= ?)
         ORDER BY r.resolved_at
-    """)
+        """,
+        (cutoff, cutoff),
+    )
 
     if len(equity_df) > 1:
         equity_df["resolved_at"] = pd.to_datetime(equity_df["resolved_at"])
@@ -263,7 +269,8 @@ def main() -> None:
     st.divider()
     st.markdown("### Recent Trades")
 
-    trades_df = _query(f"""
+    trades_df = _query(
+        """
         SELECT
             r.resolved_at as resolved,
             m.station_id as station,
@@ -275,10 +282,12 @@ def main() -> None:
         FROM results r
         JOIN signals s ON r.signal_id = s.id
         JOIN markets m ON s.market_id = m.id
-        WHERE 1=1 {time_filter}
+        WHERE (? IS NULL OR r.resolved_at >= ?)
         ORDER BY r.resolved_at DESC
         LIMIT 20
-    """)
+        """,
+        (cutoff, cutoff),
+    )
 
     if len(trades_df):
         st.dataframe(trades_df, use_container_width=True, hide_index=True)

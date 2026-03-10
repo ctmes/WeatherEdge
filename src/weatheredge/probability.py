@@ -140,11 +140,16 @@ def kelly_fraction(
     Fractional Kelly criterion for position sizing.
 
     edge:     net edge (after fees)
-    odds:     payout odds (1.0 for binary Polymarket outcomes)
+    odds:     denominator for Kelly sizing.  For Polymarket binary markets
+              this must be ``(1 - market_prob)``, giving the correct formula
+              ``f* = edge / (1 - market_prob)``.  The default of 1.0 is kept
+              for backward-compatibility but is only correct for even-money bets.
     fraction: Kelly fraction (0.25 = quarter Kelly)
     max_bet:  hard cap as fraction of bankroll
     """
     if edge <= 0:
+        return 0.0
+    if odds <= 0:
         return 0.0
     full_kelly = edge / odds
     fractional = full_kelly * fraction
