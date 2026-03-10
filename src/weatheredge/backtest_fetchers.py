@@ -247,7 +247,7 @@ async def fetch_resolved_daily_events(
             results = await asyncio.gather(*[_bounded(d) for d in batch])
             for day_raw in results:
                 for raw_event in day_raw:
-                    parsed = parse_daily_weather_event(raw_event)
+                    parsed = parse_daily_weather_event(raw_event, allow_closed=True)
                     if parsed:
                         all_pairs.append((parsed, raw_event))
             pbar.update(len(batch))

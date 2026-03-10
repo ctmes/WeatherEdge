@@ -870,12 +870,14 @@ def _extract_date_from_title(title: str) -> date | None:
     return None
 
 
-def parse_daily_weather_event(event: dict) -> ParsedMarket | None:
+def parse_daily_weather_event(event: dict, allow_closed: bool = False) -> ParsedMarket | None:
     """
     Parse a full Polymarket daily weather event (with child markets) into
     a single ParsedMarket with complete bins and outcome prices.
+
+    allow_closed: if True, parse closed/resolved events (used by backtest).
     """
-    if not event.get("active", True) or event.get("closed", False):
+    if not allow_closed and (not event.get("active", True) or event.get("closed", False)):
         return None
 
     import json

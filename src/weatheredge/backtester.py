@@ -168,13 +168,13 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
     data_source = cfg.get("data_source", "gamma")
     walk_forward = cfg.get("walk_forward", False)
 
-    # Guard: full_sim with Gamma data is meaningless — Gamma returns post-resolution
-    # prices (winner≈1.0, losers≈0.0) so edge calculation and P&L will be garbage.
+    # Warn: full_sim with Gamma data has reduced fidelity — Gamma returns
+    # post-resolution prices (winner≈1.0, losers≈0.0) so P&L will be an
+    # approximation. Use --source pmxt for tick-accurate simulation.
     if mode == "full_sim" and data_source != "pmxt":
-        raise ValueError(
-            "full_sim mode requires --data-source pmxt. "
-            "Gamma returns post-resolution prices (≈1.0/0.0) that make P&L simulation "
-            "meaningless. Use --data-source pmxt or switch to --mode brier_only."
+        log.warning(
+            "full_sim with --source gamma: Gamma returns post-resolution prices "
+            "(≈1.0/0.0). P&L will be approximate. Use --source pmxt for higher fidelity."
         )
 
     # Cache for walk-forward calibrations: {(year, month): {station_id: StationBias}}
@@ -482,8 +482,26 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
                 signals = []
             else:
                 obs_t0 = raw.get("_pmxt_orderbook")
+
+                # For Gamma source: post-resolution prices (winner≈1.0, rest≈0.0)
+                # make edge detection impossible. Substitute uniform 1/N prices so
+                # _process_market can evaluate model edge vs. a fair prior.
+                sim_parsed = parsed
+                if data_source == "gamma":
+                    prices = parsed.outcome_prices or []
+                    non_trivial = sum(1 for p in prices if p > 0.05)
+                    if non_trivial <= 1 and len(prices) > 1:
+                        import copy
+                        sim_parsed = copy.copy(parsed)
+                        n = len(prices)
+                        sim_parsed.outcome_prices = [1.0 / n] * n
+                        log.debug(
+                            "Gamma full_sim: substituted uniform 1/%d prices for %s",
+                            n, parsed.condition_id,
+                        )
+
                 signals, _detail = _process_market(
-                    parsed, fc_by_date, rg_by_date, station_cal, rolling_bankroll,
+                    sim_parsed, fc_by_date, rg_by_date, station_cal, rolling_bankroll,
                     eval_date=decision_date,
                     current_market_exposure=0.0,
                     current_total_exposure=0.0,
@@ -604,7 +622,7 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
                 tqdm.write(f"  Forecast: {forecast.tmax_mean:.1f}°C (std={forecast.tmax_std:.1f})")
                 tqdm.write(f"  Bet:      \033[1m{sig.bin_label}\033[0m @ {sig.model_prob:.0%} model vs {sig.market_prob:.0%} market")
                 tqdm.write(f"  Fidelity: {fidelity.upper()} | Fill: {actual_fill:.3f} | Slip: {actual_slip:+.3f}")
-                tqdm.write(f"  Actual:   {resolved_label} → {win_loss_label} | P&L: {pnl:+.2f} | Bankroll: ${rolling_bankroll:,.0f}")
+                tqdm.write(f"  Actual:   {resolved_label} -> {win_loss_label} | P&L: {pnl:+.2f} | Bankroll: ${rolling_bankroll:,.0f}")
                 
                 all_signals.append(sig)
                 all_results.append({
@@ -636,7 +654,7 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
             q_short = sig.question.encode('ascii', 'ignore').decode('ascii')[:30]
             bet_label = sig.bin_label[:16]
             actual = r.get("resolved_label", f"Bin {r['resolved_bin']}")[:16]
-            wl = "✓" if r["won"] else "✗"
+            wl = "WIN" if r["won"] else "LOSS"
             print(f"{r['decision_date']}  {q_short:<30} {bet_label:<16} {actual:<16} {r['pnl']:>+8.2f} {wl:>5}")
         print(f"{'='*90}")
         wins = sum(1 for r in all_results if r["won"])

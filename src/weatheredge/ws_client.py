@@ -148,8 +148,9 @@ class OrderbookSnapshot:
         bids.sort(key=lambda x: x.price, reverse=True)
         asks.sort(key=lambda x: x.price)
 
+        asset_id = msg.get("asset_id") or msg.get("market", "")
         return cls(
-            asset_id=msg.get("asset_id", ""),
+            asset_id=asset_id,
             market=msg.get("market", ""),
             timestamp=int(msg.get("timestamp", 0)),
             bids=bids,
@@ -274,7 +275,7 @@ class WeatherEdgeMarketWS:
             return
         self._subscribed_assets.update(asset_ids)
         if self._ws:
-            msg = {"assets_ids": list(asset_ids), "type": "market"}
+            msg = {"type": "subscribe", "assets_ids": list(asset_ids)}
             await self._ws.send(json.dumps(msg))
             logger.info("Subscribed to %d assets", len(asset_ids))
 
@@ -307,18 +308,23 @@ class WeatherEdgeMarketWS:
             return
 
         event_type = data.get("event_type")
+        # Log keys for debugging field name changes in Polymarket API
+        logger.debug("WS message: event_type=%s, keys=%s", event_type, list(data.keys()))
 
         if event_type == "book":
             snapshot = OrderbookSnapshot.from_message(data)
+            # Store under both decimal ID and hex address to ensure price_change matches
             self._orderbooks[snapshot.asset_id] = snapshot
-            # FIX #8: %s logging
-            logger.debug("Book snapshot for asset %s", snapshot.asset_id)
+            if snapshot.market and snapshot.market != snapshot.asset_id:
+                self._orderbooks[snapshot.market] = snapshot
+            
+            logger.debug("Book snapshot for asset %s (market %s)", snapshot.asset_id, snapshot.market)
             await self._invoke_callback(self.on_book_update, snapshot, "on_book_update")
 
         elif event_type == "price_change":
             # FIX #7: apply incremental level updates in-place so the book
             # stays accurate between full snapshots.
-            asset_id = data.get("asset_id", "")
+            asset_id = data.get("asset_id") or data.get("market", "")
             changes = data.get("changes", [])
             ob = self._orderbooks.get(asset_id)
             if ob is not None and changes:
@@ -329,7 +335,8 @@ class WeatherEdgeMarketWS:
                 await self._invoke_callback(self.on_book_update, ob, "on_book_update")
             else:
                 logger.debug(
-                    "price_change for unknown asset %s — no snapshot cached yet", asset_id
+                    "price_change for unknown asset %s — no snapshot cached yet. Message keys: %s",
+                    asset_id, list(data.keys())
                 )
 
         elif event_type == "trade":

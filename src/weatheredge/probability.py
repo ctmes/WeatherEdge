@@ -182,8 +182,6 @@ def kelly_fraction(
     """
     if edge <= 0:
         return 0.0
-    if odds <= 0:
-        return 0.0
     if market_price <= 0 or market_price >= 1:
         return 0.0
     odds = (1.0 / market_price) - 1.0

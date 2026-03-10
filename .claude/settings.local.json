@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m weatheredge --help)",
+      "Bash(python -m weatheredge backtest --help)",
+      "Bash(find 'c:/Users/Colin/Desktop/August Labs/polymarket/weather' -name *.json -path */backtest*)",
+      "Bash(python -c \":*)",
+      "Bash(python -m weatheredge backtest --start 2026-03-01 --end 2026-03-03)",
+      "Bash(python -m weatheredge backtest --start 2026-03-01 --end 2026-03-03 --mode full_sim)",
+      "Bash(python -m weatheredge backtest --start 2026-03-01 --end 2026-03-01 --mode full_sim)"
+    ]
+  }
+}

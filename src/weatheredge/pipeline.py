@@ -26,6 +26,7 @@ from weatheredge.probability import (
 )
 from weatheredge.ws_client import OrderbookSnapshot
 from weatheredge.regime import RegimeAssessment, adjust_edge_threshold, assess_regime
+from weatheredge.filters import check_midpoint_integrity
 from weatheredge.safety import PositionLimits, check_position_limits
 from weatheredge.stations import get_station
 
@@ -466,42 +467,16 @@ def _process_market(
             bet_size_usd=bankroll * 0.01,
             market_volume=market.volume,
         )
-        edge = calculate_edge(mp, mkt_p, dynamic_slippage=preliminary_slip)
+        edge = calculate_edge(mp, mkt_p, mkt_p, dynamic_slippage=preliminary_slip)
 
-        # -- Adversary Filter: Midpoint Integrity ---------------------
-        integrity_multiplier = 1.0
-        if orderbooks:
-            # For daily events, token_ids map one-to-one with bins
-            tid = market.token_ids[i] if i < len(market.token_ids) else None
-            book = orderbooks.get(tid) if tid else None
-            if book:
-                integrity = check_midpoint_integrity(book.get("bids"), book.get("asks"))
-                integrity_multiplier = integrity["multiplier"]
-                if integrity["is_spooky"]:
-                    logger.warning(
-                        "Market %s bin %d classified as spooky: %s (multiplier %.2f)",
-                        market.condition_id, i, integrity["reason"], integrity_multiplier
-                    )
-            elif len(market.token_ids) == 0:
-                # Binary market fallback
-                book = orderbooks.get(market.condition_id)
-                if book:
-                    integrity = check_midpoint_integrity(book.get("bids"), book.get("asks"))
-                    integrity_multiplier = integrity["multiplier"]
-                else:
-                    integrity_multiplier = 0.0
-            else:
-                # No orderbook for this bin = no liquidity
-                integrity_multiplier = 0.0
-
-        # Apply regime + integrity multipliers
+        # Apply regime + integrity multipliers (integrity_multiplier set by _resolve_market_price)
         combined_multiplier = regime_assessment.confidence_multiplier * integrity_multiplier
 
         # Apply regime confidence multiplier to sizing
         if edge >= edge_threshold and combined_multiplier > 0:
             adjusted_edge = edge * combined_multiplier
-            kf = kelly_fraction(adjusted_edge, odds=(1.0 - mkt_p))
-            bet = recommended_bet_usd(adjusted_edge, bankroll, odds=(1.0 - mkt_p))
+            kf = kelly_fraction(adjusted_edge, mkt_p)
+            bet = recommended_bet_usd(adjusted_edge, mkt_p, bankroll)
 
             # Cap bet to max allowed (3% per config/safety)
             if bet > bankroll * 0.03:
@@ -514,7 +489,7 @@ def _process_market(
             )
 
             # Recalculate edge with refined slippage
-            refined_edge = calculate_edge(mp, mkt_p, dynamic_slippage=dyn_slippage)
+            refined_edge = calculate_edge(mp, mkt_p, mkt_p, dynamic_slippage=dyn_slippage)
             if refined_edge < edge_threshold:
                 # Edge evaporated once we accounted for realistic slippage
                 continue
@@ -549,22 +524,6 @@ def _process_market(
         if refined_edge < edge_threshold:
             continue
 
-            adjusted_edge = refined_edge * combined_multiplier
-            kf = kelly_fraction(adjusted_edge, odds=(1.0 - mkt_p))
-            bet = recommended_bet_usd(adjusted_edge, bankroll, odds=(1.0 - mkt_p))
-            if bet > bankroll * 0.03:
-                bet = bankroll * 0.03
-
-            # Position limit check
-            allowed, reason = check_position_limits(
-                proposed_bet_usd=bet,
-                bankroll=bankroll,
-                current_market_exposure=current_market_exposure,
-                current_total_exposure=current_total_exposure,
-            )
-            if not allowed:
-                logger.debug("Position limit blocked: %s", reason)
-                continue
         adjusted_edge = refined_edge * combined_multiplier
 
         # FIX #1: pass mkt_p as market_price so Kelly uses correct payout odds
