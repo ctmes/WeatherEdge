@@ -168,6 +168,15 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
     data_source = cfg.get("data_source", "gamma")
     walk_forward = cfg.get("walk_forward", False)
 
+    # Guard: full_sim with Gamma data is meaningless — Gamma returns post-resolution
+    # prices (winner≈1.0, losers≈0.0) so edge calculation and P&L will be garbage.
+    if mode == "full_sim" and data_source != "pmxt":
+        raise ValueError(
+            "full_sim mode requires --data-source pmxt. "
+            "Gamma returns post-resolution prices (≈1.0/0.0) that make P&L simulation "
+            "meaningless. Use --data-source pmxt or switch to --mode brier_only."
+        )
+
     # Cache for walk-forward calibrations: {(year, month): {station_id: StationBias}}
     wf_cal_cache: dict[tuple[int, int], dict[str, Any]] = {}
 
@@ -421,11 +430,13 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
                 forecast = await fetch_historical_forecast_ensemble(
                     station.latitude, station.longitude, target_date,
                     timezone=station.timezone,
+                    decision_date=decision_date,
                 )
             else:
                 forecast = await fetch_historical_forecast(
                     station.latitude, station.longitude, target_date,
                     model=model, timezone=station.timezone,
+                    decision_date=decision_date,
                 )
 
 

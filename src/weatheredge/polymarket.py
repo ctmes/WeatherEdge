@@ -702,6 +702,69 @@ def parse_bins_from_outcomes(outcomes: list[str]) -> list[tuple[float, float]]:
 # Price fetching
 # =========================================================================
 
+async def enrich_markets_with_live_prices(
+    markets: list[ParsedMarket],
+) -> tuple[list[ParsedMarket], dict[str, dict]]:
+    """
+    Fetch live CLOB midpoint prices for all markets and update outcome_prices in-place.
+
+    Returns (markets, orderbooks) where orderbooks maps token_id -> minimal bid/ask dict
+    for the midpoint integrity filter.  Any market whose token_ids are empty or whose
+    midpoints call fails retains its Gamma prices unchanged.
+    """
+    all_token_ids: list[str] = [
+        tid
+        for m in markets
+        for tid in m.token_ids
+        if tid and not _looks_like_condition_id(tid)
+    ]
+
+    if not all_token_ids:
+        log.warning("enrich_markets_with_live_prices: no valid CLOB token IDs — using Gamma prices")
+        return markets, {}
+
+    midpoints = await fetch_midpoint_prices(all_token_ids)
+
+    if not midpoints:
+        log.warning("enrich_markets_with_live_prices: CLOB midpoints returned empty — using Gamma prices")
+        return markets, {}
+
+    enriched = 0
+    orderbooks: dict[str, dict] = {}
+
+    for m in markets:
+        if not m.token_ids:
+            continue
+
+        new_prices: list[float] = []
+        any_live = False
+
+        for idx, tid in enumerate(m.token_ids):
+            mid = midpoints.get(tid)
+            if mid is not None and 0.0 < mid < 1.0:
+                new_prices.append(mid)
+                any_live = True
+                # Build a minimal synthetic orderbook so the integrity filter has data
+                half_spread = 0.005
+                orderbooks[tid] = {
+                    "bids": [[mid - half_spread, 100]],
+                    "asks": [[mid + half_spread, 100]],
+                }
+            else:
+                fallback = m.outcome_prices[idx] if idx < len(m.outcome_prices) else 0.0
+                new_prices.append(fallback)
+
+        if any_live:
+            m.outcome_prices = new_prices
+            enriched += 1
+
+    log.info(
+        "Live CLOB enrichment: updated %d/%d markets with real-time midpoint prices",
+        enriched, len(markets),
+    )
+    return markets, orderbooks
+
+
 async def fetch_midpoint_prices(token_ids: list[str]) -> dict[str, float]:
     """
     Fetch midpoint prices for the given Polymarket CLOB token IDs.

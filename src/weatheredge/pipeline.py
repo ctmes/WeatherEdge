@@ -15,7 +15,7 @@ from weatheredge.calibration import StationBias, apply_calibration, apply_calibr
 from weatheredge.config import TRADING
 from weatheredge.forecast import AtmosphericRegime, fetch_forecast, fetch_regime_data
 from weatheredge.models import EdgeSignal, ForecastResult, ParsedMarket
-from weatheredge.polymarket import fetch_weather_markets, parse_bins_from_outcomes, fetch_midpoint_prices
+from weatheredge.polymarket import fetch_weather_markets, parse_bins_from_outcomes, enrich_markets_with_live_prices
 from weatheredge.probability import (
     StaleMarketPricesError,
     calculate_edge,
@@ -127,20 +127,11 @@ async def run_scan(
             sample,
             " ..." if len(unmatched_markets) > 3 else "",
         )
-    # FIX: Fetch live CLOB midpoints if no orderbooks provided
+    # ── 1b. Enrich with live CLOB midpoint prices ─────────────────────────
+    # Updates market.outcome_prices in-place with real-time CLOB data and builds
+    # synthetic orderbooks for the midpoint integrity filter.
     if orderbooks is None:
-        all_token_ids = []
-        for m_list in station_markets.values():
-            for m in m_list:
-                all_token_ids.extend(m.token_ids)
-        
-        if all_token_ids:
-            logger.info("Fetching live CLOB prices for %d tokens...", len(all_token_ids))
-            midpoints = await fetch_midpoint_prices(all_token_ids)
-            if midpoints:
-                # Convert to the format expected by _resolve_market_price
-                orderbooks = {tid: {"mid": price, "bids": [], "asks": []} for tid, price in midpoints.items()}
-                logger.info("Successfully enriched scan with %d CLOB midpoints", len(midpoints))
+        markets, orderbooks = await enrich_markets_with_live_prices(markets)
 
     for m in unmatched_markets[:5]:
         logger.debug("Unmatched: %s (station_id=%s)", m.question[:60], m.station_id)
