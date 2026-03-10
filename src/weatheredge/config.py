@@ -24,7 +24,7 @@ load_dotenv(_PROJECT_ROOT / ".env")
 
 DATABASE_URL: str = os.getenv(
     "DATABASE_URL",
-    f"sqlite+aiosqlite:///{_PROJECT_ROOT / 'weatheredge.db'}",
+    f"sqlite+aiosqlite:///{_PROJECT_ROOT / 'data' / 'weatheredge.db'}",
 )
 
 
@@ -34,6 +34,9 @@ DATABASE_URL: str = os.getenv(
 
 POLYMARKET_CLOB_BASE = "https://clob.polymarket.com"
 POLYMARKET_GAMMA_BASE = "https://gamma-api.polymarket.com"
+
+# SSL Verification
+VERIFY_SSL: bool = os.getenv("VERIFY_SSL", "true").lower() == "true"
 
 # Keywords used to filter weather markets from the full market list
 WEATHER_KEYWORDS: list[str] = [
@@ -61,6 +64,24 @@ WEATHER_KEYWORDS: list[str] = [
     "flood",
     "celsius",
     "fahrenheit",
+]
+
+# Targeted series slugs for high-priority discovery
+WEATHER_SERIES_SLUGS: list[str] = [
+    "seattle-daily-weather",
+    "new-york-daily-weather",
+    "los-angeles-daily-weather",
+    "chicago-daily-weather",
+    "miami-daily-weather",
+    "daily-weather",
+    "temperature-daily",
+]
+
+# Tag slugs for categorical discovery
+WEATHER_TAG_SLUGS: list[str] = [
+    "weather",
+    "temperature",
+    "daily-temperature",
 ]
 
 # Blocklist — if ANY of these appear in the market text, reject it even if
@@ -166,6 +187,9 @@ class TradingConfig:
     model_divergence_no_bet: float = 3.0        # °C — no bet if GFS/ECMWF differ by more
     ensemble_spread_reduce: float = 4.0         # °C — reduce sizing by 50%
     ensemble_spread_no_bet: float = 6.0         # °C — no bet
+
+    # Live Trading Toggle
+    live_trading_enabled: bool = False          # Set to True for real money (DANGEROUS)
 
 
 TRADING = TradingConfig()

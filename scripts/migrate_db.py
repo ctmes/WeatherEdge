@@ -7,7 +7,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger("migrate_db")
 
 def migrate():
-    db_path = "weatheredge.db"
+    db_path = os.path.join(os.path.dirname(__file__), "..", "data", "weatheredge.db")
     if not os.path.exists(db_path):
         logger.error(f"Database file {db_path} not found.")
         return

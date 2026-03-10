@@ -20,6 +20,8 @@ Usage:
 
     python -m weatheredge resolve           # check resolved markets
 
+    python -m weatheredge live-paper        # start real-time paper trading (WebSocket)
+
     python -m weatheredge dashboard         # launch Streamlit dashboard
 
 """
@@ -44,6 +46,13 @@ import sys
 
 from weatheredge.pipeline import run_scan
 from weatheredge.stations import get_station
+
+def _run_live_paper(args: argparse.Namespace) -> None:
+    from weatheredge.live_paper import run_live_paper
+    asyncio.run(run_live_paper(
+        bankroll=args.bankroll,
+        update_interval=args.interval
+    ))
 
 
 
@@ -77,6 +86,10 @@ def main() -> None:
     )
 
     scan_parser.add_argument(
+        "--deep-scan", action="store_true", help="Perform exhaustive brute-force event scan",
+    )
+
+    scan_parser.add_argument(
 
         "-v", "--verbose", action="store_true", help="Enable debug logging",
 
@@ -96,6 +109,10 @@ def main() -> None:
 
         "--bankroll", type=float, default=10_000.0,
 
+    )
+
+    diag_parser.add_argument(
+        "--deep-scan", action="store_true", help="Perform exhaustive brute-force event scan",
     )
 
     diag_parser.add_argument(
@@ -167,6 +184,10 @@ def main() -> None:
 
         help="Run a single scan-and-log cycle then exit",
 
+    )
+
+    run_parser.add_argument(
+        "--deep-scan", action="store_true", help="Perform exhaustive brute-force event scan",
     )
 
     run_parser.add_argument(
@@ -305,6 +326,22 @@ def main() -> None:
     )
 
 
+    # -- live-paper ---------------------------------------------------
+    lp_parser = subparsers.add_parser(
+        "live-paper", help="Start real-time paper trading using WebSockets"
+    )
+    lp_parser.add_argument(
+        "--bankroll", type=float, default=10_000.0,
+        help="Bankroll in USD for Kelly sizing (default: 10000)",
+    )
+    lp_parser.add_argument(
+        "--interval", type=float, default=10.0,
+        help="Seconds between evaluation cycles (default: 10)",
+    )
+    lp_parser.add_argument(
+        "-v", "--verbose", action="store_true", help="Enable debug logging",
+    )
+
     args = parser.parse_args()
 
 
@@ -362,6 +399,8 @@ def main() -> None:
         _run_backtest(args)
     elif args.command == "inspect":
         _run_inspect(args)
+    elif args.command == "live-paper":
+        _run_live_paper(args)
     elif args.command == "probe-pmxt":
         _run_probe_pmxt(args)
 
@@ -380,7 +419,10 @@ def main() -> None:
 
 def _run_scan(args: argparse.Namespace) -> None:
 
-    signals, _ = asyncio.run(run_scan(bankroll=args.bankroll))
+    signals, _ = asyncio.run(run_scan(
+        bankroll=args.bankroll,
+        deep_scan=args.deep_scan,
+    ))
 
 
 
@@ -409,9 +451,11 @@ def _run_scan(args: argparse.Namespace) -> None:
 def _run_diagnose(args: argparse.Namespace) -> None:
 
     signals, diag = asyncio.run(
-
-        run_scan(bankroll=args.bankroll, diagnostics=True)
-
+        run_scan(
+            bankroll=args.bankroll,
+            diagnostics=True,
+            deep_scan=args.deep_scan,
+        )
     )
 
 
