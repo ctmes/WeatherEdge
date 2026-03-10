@@ -168,13 +168,22 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
     data_source = cfg.get("data_source", "gamma")
     walk_forward = cfg.get("walk_forward", False)
 
-    # Warn: full_sim with Gamma data has reduced fidelity — Gamma returns
-    # post-resolution prices (winner≈1.0, losers≈0.0) so P&L will be an
-    # approximation. Use --source pmxt for tick-accurate simulation.
-    if mode == "full_sim" and data_source != "pmxt":
-        log.warning(
-            "full_sim with --source gamma: Gamma returns post-resolution prices "
-            "(≈1.0/0.0). P&L will be approximate. Use --source pmxt for higher fidelity."
+    # Block: full_sim requires real pre-resolution market prices.
+    # Gamma returns post-resolution prices (winner≈1.0, losers≈0.0) which
+    # produce a uniform 1/N substitution (≈11% per bin for 9-bin markets),
+    # making every market appear to have edge. This is not a valid simulation.
+    if mode == "full_sim" and data_source == "gamma":
+        raise ValueError(
+            "Cannot run full_sim with --source gamma.\n"
+            "Gamma returns post-resolution prices (winner≈1.0, losers≈0.0) which "
+            "are substituted with uniform 1/N prices (≈11% per bin) — every market "
+            "will show phantom edge and P&L results will be meaningless.\n\n"
+            "Use --source clob for real pre-resolution prices (unlimited history):\n"
+            "  weatheredge backtest --source clob --mode full_sim\n\n"
+            "Or --source pmxt for richer orderbook data (Feb 2026+):\n"
+            "  weatheredge backtest --source pmxt --mode full_sim\n\n"
+            "For forecast accuracy only (Brier scores, no market prices needed):\n"
+            "  weatheredge backtest --source gamma --mode brier_only"
         )
 
     # Cache for walk-forward calibrations: {(year, month): {station_id: StationBias}}
@@ -218,8 +227,12 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
             start, end, model_name=model, latency_seconds=latency_s
         )
         log.info("Found %d weather markets from pmxt archive", len(market_pairs))
+    elif data_source == "clob":
+        from weatheredge.backtest_fetchers import fetch_clob_resolved_markets
+        market_pairs = await fetch_clob_resolved_markets(start, end, model_name=model)
+        log.info("Found %d weather markets enriched with CLOB prices-history", len(market_pairs))
     else:
-        # Default: fetch from Gamma API
+        # data_source == "gamma": only valid for brier_only (ValueError raised above for full_sim)
         legacy_market_pairs = await fetch_resolved_markets(start, end)
         daily_event_pairs = await fetch_resolved_daily_events(start, end)
         market_pairs = legacy_market_pairs + daily_event_pairs
@@ -483,22 +496,9 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
             else:
                 obs_t0 = raw.get("_pmxt_orderbook")
 
-                # For Gamma source: post-resolution prices (winner≈1.0, rest≈0.0)
-                # make edge detection impossible. Substitute uniform 1/N prices so
-                # _process_market can evaluate model edge vs. a fair prior.
+                # Real pre-resolution prices are already set on parsed.outcome_prices
+                # by the "clob" or "pmxt" fetchers. gamma+full_sim is blocked above.
                 sim_parsed = parsed
-                if data_source == "gamma":
-                    prices = parsed.outcome_prices or []
-                    non_trivial = sum(1 for p in prices if p > 0.05)
-                    if non_trivial <= 1 and len(prices) > 1:
-                        import copy
-                        sim_parsed = copy.copy(parsed)
-                        n = len(prices)
-                        sim_parsed.outcome_prices = [1.0 / n] * n
-                        log.debug(
-                            "Gamma full_sim: substituted uniform 1/%d prices for %s",
-                            n, parsed.condition_id,
-                        )
 
                 signals, _detail = _process_market(
                     sim_parsed, fc_by_date, rg_by_date, station_cal, rolling_bankroll,

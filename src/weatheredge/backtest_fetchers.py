@@ -28,6 +28,7 @@ from weatheredge.config import (
     OPEN_METEO_API_KEY,
     OPEN_METEO_HISTORICAL,
     OPEN_METEO_MODELS,
+    POLYMARKET_CLOB_BASE,
     POLYMARKET_GAMMA_BASE,
 )
 from weatheredge.models import ForecastResult, ParsedMarket
@@ -494,3 +495,149 @@ async def fetch_historical_forecast_ensemble(
         tmin_std=float(max(1.0, np.std(tmin_arr))) if tmin_arr is not None and len(tmin_arr) > 1 else 1.5,
         models_used=used,
     )
+
+
+# =========================================================================
+# CLOB prices-history: real pre-resolution market prices
+# =========================================================================
+
+async def fetch_clob_price_at_time(
+    token_id: str,
+    target_dt: datetime,
+) -> float | None:
+    """
+    Fetch the Polymarket CLOB midpoint price for a single token at or just
+    before ``target_dt``.
+
+    Calls ``GET https://clob.polymarket.com/prices-history?market={token_id}
+    &interval=max&fidelity=1`` which returns the full 1-minute price history
+    for the token going back to market creation.
+
+    Returns the last known midpoint price at or before ``target_dt``, or
+    ``None`` if the API returns no data.  Results are cached on disk keyed by
+    ``(token_id, date)`` so repeated backtest runs don't re-download.
+    """
+    date_str = target_dt.date().isoformat()
+    cache_k = _cache_key("clob_ph", token_id, date_str)
+    history: list[dict] | None = _read_cache(cache_k)
+
+    if history is None:
+        url = f"{POLYMARKET_CLOB_BASE}/prices-history"
+        params = {"market": token_id, "interval": "max", "fidelity": 1}
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(url, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+                history = data.get("history", [])
+                _write_cache(cache_k, history)
+        except Exception as e:
+            log.warning(
+                "CLOB prices-history fetch failed for token %s...%s: %s",
+                token_id[:8], token_id[-4:], e,
+            )
+            return None
+
+    if not history:
+        return None
+
+    # history is sorted ascending by timestamp — walk forward and keep the
+    # last price at or before target_dt.
+    target_ts = int(target_dt.timestamp())
+    best_price: float | None = None
+    for entry in history:
+        t = entry.get("t", 0)
+        p = entry.get("p")
+        if p is None:
+            continue
+        if t <= target_ts:
+            best_price = float(p)
+        else:
+            break  # past target time — stop
+
+    return best_price
+
+
+async def fetch_clob_resolved_markets(
+    start: date,
+    end: date,
+    *,
+    model_name: str = "ecmwf_ifs",
+) -> list[tuple[ParsedMarket, dict]]:
+    """
+    Fetch resolved weather markets from Gamma, then enrich each market's
+    ``outcome_prices`` with real pre-resolution midpoints from the Polymarket
+    CLOB ``prices-history`` API.
+
+    Decision time is 00:00 UTC on each market's resolution date — the
+    pre-dawn price before any weather observations for the day are known.
+
+    Bins with no CLOB data get price ``0.0``; ``normalise_market_probs()``
+    in the pipeline floors these to 1% and re-normalises.
+    """
+    from tqdm import tqdm
+
+    # Step 1: Gamma for market metadata + resolution outcomes.
+    # Try multi-outcome daily events first (the primary format), then fall
+    # back to simple binary markets.
+    all_pairs: list[tuple[ParsedMarket, dict]] = await fetch_resolved_daily_events(
+        start, end
+    )
+    if not all_pairs:
+        log.info("No daily events found — falling back to fetch_resolved_markets")
+        all_pairs = await fetch_resolved_markets(start, end)
+
+    if not all_pairs:
+        return []
+
+    # Step 2: Enrich each market's outcome_prices with real CLOB prices.
+    enriched_pairs: list[tuple[ParsedMarket, dict]] = []
+    enriched_count = 0
+
+    for parsed, raw in tqdm(all_pairs, desc="CLOB prices ", unit="mkt", leave=False):
+        res_date = parsed.resolution_date
+        if res_date is None:
+            log.warning(
+                "Market %s has no resolution_date — skipping CLOB enrichment",
+                parsed.condition_id,
+            )
+            enriched_pairs.append((parsed, raw))
+            continue
+
+        token_ids = parsed.token_ids
+        if not token_ids:
+            log.warning(
+                "Market %s (%s) has no token_ids — cannot fetch CLOB prices",
+                parsed.condition_id, parsed.question[:40],
+            )
+            enriched_pairs.append((parsed, raw))
+            continue
+
+        # Decision time: 00:00 UTC on the resolution date.
+        decision_dt = datetime(res_date.year, res_date.month, res_date.day, 0, 0, 0)
+
+        # Fetch prices for all bins of this market concurrently.
+        prices_raw = await asyncio.gather(
+            *[fetch_clob_price_at_time(tid, decision_dt) for tid in token_ids]
+        )
+
+        new_prices = [float(p) if p is not None else 0.0 for p in prices_raw]
+
+        if any(p > 0.0 for p in new_prices):
+            parsed.outcome_prices = new_prices
+            raw["_clob_prices"] = dict(zip(token_ids, new_prices))
+            enriched_count += 1
+        else:
+            log.warning(
+                "CLOB prices-history returned no data for any bin of %s (%s) — "
+                "prices will be 0.0 → floored to 1%% by normalisation",
+                parsed.condition_id, parsed.question[:40],
+            )
+
+        enriched_pairs.append((parsed, raw))
+
+    log.info(
+        "CLOB enrichment: %d/%d markets got real pre-resolution prices",
+        enriched_count, len(all_pairs),
+    )
+    return enriched_pairs

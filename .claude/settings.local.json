@@ -7,7 +7,16 @@
       "Bash(python -c \":*)",
       "Bash(python -m weatheredge backtest --start 2026-03-01 --end 2026-03-03)",
       "Bash(python -m weatheredge backtest --start 2026-03-01 --end 2026-03-03 --mode full_sim)",
-      "Bash(python -m weatheredge backtest --start 2026-03-01 --end 2026-03-01 --mode full_sim)"
+      "Bash(python -m weatheredge backtest --start 2026-03-01 --end 2026-03-01 --mode full_sim)",
+      "Bash(find \"/Users/colin/August Labs/WeatherEdge/src/weatheredge\" -name \"*.py\" -type f -exec ls -lh {})",
+      "Read(//Users/colin/August Labs/WeatherEdge/**)",
+      "Bash(sort -k2)",
+      "Bash(grep -rn \"to_csv\\\\|my_backtest\" '/Users/colin/August Labs/WeatherEdge' --include=*.py)",
+      "Bash(python -m weatheredge backtest --start 2026-03-09 --end 2026-03-09 --source gamma --mode full_sim)",
+      "Bash(python -m weatheredge backtest --start 2026-03-09 --end 2026-03-09 --source gamma --mode brier_only)",
+      "Bash(timeout 60 python -m weatheredge backtest --start 2026-03-09 --end 2026-03-09 --source clob --mode full_sim)",
+      "Bash(python -m weatheredge backtest --start 2026-03-09 --end 2026-03-09 --source clob --mode full_sim)",
+      "Bash(grep -E \"model vs|Fill:|Backtesting|market$|ERROR|Warning|clob\")"
     ]
   }
 }

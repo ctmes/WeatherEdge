@@ -273,9 +273,15 @@ def main() -> None:
         help="Backtest mode: brier_only (forecast skill only) or full_sim (P&L simulation)",
     )
     bt_parser.add_argument(
-        "--source", type=str, default="gamma",
-        choices=["gamma", "pmxt"],
-        help="Market data source: gamma (Polymarket API) or pmxt (archive.pmxt.dev)",
+        "--source", type=str, default="clob",
+        choices=["gamma", "pmxt", "clob"],
+        help=(
+            "Market data source: "
+            "clob (default — real pre-resolution prices from Polymarket CLOB prices-history, "
+            "unlimited history), "
+            "pmxt (archive.pmxt.dev Parquet — richer orderbook data, ~Feb 2026+), "
+            "gamma (Gamma API post-resolution prices — only valid with --mode brier_only)"
+        ),
     )
     bt_parser.add_argument(
         "--walk-forward", action="store_true",
