@@ -36,6 +36,16 @@ _markets_cache: dict[str, Any] | None = None   # {market_id -> slug, asset_id_0 
 _markets_loaded_at: float = 0.0
 _MARKETS_TTL = 86_400  # 24 h
 
+# Lock to prevent concurrent downloads (thundering herd)
+_markets_lock: asyncio.Lock | None = None
+
+
+def _get_markets_lock() -> asyncio.Lock:
+    global _markets_lock
+    if _markets_lock is None:
+        _markets_lock = asyncio.Lock()
+    return _markets_lock
+
 # Semaphore: be polite to the Telonex API (2 concurrent requests max)
 _sem: asyncio.Semaphore | None = None
 
@@ -65,58 +75,65 @@ async def _load_markets_metadata() -> dict[str, str]:
     if _markets_cache is not None and (now - _markets_loaded_at) < _MARKETS_TTL:
         return _markets_cache  # type: ignore[return-value]
 
-    # Try disk cache first (keyed by day so it refreshes daily)
-    disk_key = _cache_key("telonex_markets", datetime.utcnow().strftime("%Y-%m-%d"))
-    cached_rows = read_cache(_SUBDIR, disk_key, max_age_hours=24)
-    if cached_rows is not None:
-        _markets_cache = cached_rows
-        _markets_loaded_at = now
-        return _markets_cache  # type: ignore[return-value]
+    # Serialize: only one coroutine downloads; the rest wait and reuse the result.
+    async with _get_markets_lock():
+        # Re-check after acquiring lock — another coroutine may have populated it.
+        now = time.monotonic()
+        if _markets_cache is not None and (now - _markets_loaded_at) < _MARKETS_TTL:
+            return _markets_cache  # type: ignore[return-value]
 
-    log.info("Fetching Telonex markets metadata (one-time download)...")
-    try:
-        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-            resp = await client.get(
-                f"{TELONEX_BASE}/datasets/polymarket/markets",
-                headers={"Authorization": f"Bearer {TELONEX_API_KEY}"},
-            )
-            resp.raise_for_status()
-            content = resp.content
-    except Exception as e:
-        log.warning("Failed to fetch Telonex markets metadata: %s", e)
-        _markets_cache = _markets_cache or {}
-        return _markets_cache  # type: ignore[return-value]
+        # Try disk cache first (keyed by day so it refreshes daily)
+        disk_key = _cache_key("telonex_markets", datetime.utcnow().strftime("%Y-%m-%d"))
+        cached_rows = read_cache(_SUBDIR, disk_key, max_age_hours=24)
+        if cached_rows is not None:
+            _markets_cache = cached_rows
+            _markets_loaded_at = now
+            return _markets_cache  # type: ignore[return-value]
 
-    try:
-        import pandas as pd
-        df = pd.read_parquet(BytesIO(content))
+        log.info("Fetching Telonex markets metadata (one-time download)...")
+        try:
+            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+                resp = await client.get(
+                    f"{TELONEX_BASE}/datasets/polymarket/markets",
+                    headers={"Authorization": f"Bearer {TELONEX_API_KEY}"},
+                )
+                resp.raise_for_status()
+                content = resp.content
+        except Exception as e:
+            log.warning("Failed to fetch Telonex markets metadata: %s", e)
+            _markets_cache = _markets_cache or {}
+            return _markets_cache  # type: ignore[return-value]
 
-        # Only keep rows that have trades data
-        has_trades = df["trades_from"].notna() & (df["trades_from"] != "")
-        df = df[has_trades]
+        try:
+            import pandas as pd
+            df = pd.read_parquet(BytesIO(content))
 
-        lookup: dict[str, str] = {}
-        for _, row in df.iterrows():
-            slug = row.get("slug", "")
-            if not slug:
-                continue
-            mid = str(row.get("market_id", "")).strip()
-            aid = str(row.get("asset_id_0", "")).strip()
-            if mid:
-                lookup[mid.lower()] = slug
-            if aid:
-                lookup[aid] = slug
+            # Only keep rows that have trades data
+            has_trades = df["trades_from"].notna() & (df["trades_from"] != "")
+            df = df[has_trades]
 
-        write_cache(_SUBDIR, disk_key, lookup)
-        _markets_cache = lookup
-        _markets_loaded_at = now
-        log.info("Telonex markets metadata loaded: %d slug mappings", len(lookup))
-        return lookup
+            lookup: dict[str, str] = {}
+            for _, row in df.iterrows():
+                slug = row.get("slug", "")
+                if not slug:
+                    continue
+                mid = str(row.get("market_id", "")).strip()
+                aid = str(row.get("asset_id_0", "")).strip()
+                if mid:
+                    lookup[mid.lower()] = slug
+                if aid:
+                    lookup[aid] = slug
 
-    except Exception as e:
-        log.warning("Failed to parse Telonex markets parquet: %s", e)
-        _markets_cache = _markets_cache or {}
-        return _markets_cache  # type: ignore[return-value]
+            write_cache(_SUBDIR, disk_key, lookup)
+            _markets_cache = lookup
+            _markets_loaded_at = now
+            log.info("Telonex markets metadata loaded: %d slug mappings", len(lookup))
+            return lookup
+
+        except Exception as e:
+            log.warning("Failed to parse Telonex markets parquet: %s", e)
+            _markets_cache = _markets_cache or {}
+            return _markets_cache  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
