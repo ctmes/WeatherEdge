@@ -23,7 +23,9 @@ from weatheredge.cache import cache_key as _cache_key, read_cache, write_cache
 log = logging.getLogger("weatheredge.mesonet")
 
 IEM_BASE = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
+ERA5_BASE = "https://archive-api.open-meteo.com/v1/archive"
 _SUBDIR = "mesonet_cache"
+_MIN_IEM_COVERAGE = 0.25  # fall back to ERA5 if IEM returns <25% of requested days
 
 
 def _read_cache(key: str) -> list[dict[str, str]] | None:
@@ -71,11 +73,16 @@ async def fetch_daily_observations(
     station_id: str,
     start_date: date,
     end_date: date,
+    *,
+    latitude: float | None = None,
+    longitude: float | None = None,
 ) -> list[DailyObservation]:
     """
     Fetch daily max/min temperature and precipitation from IEM ASOS.
 
     station_id: 4-letter ICAO code (e.g. NZWN, KORD)
+    latitude/longitude: if provided, used as ERA5 fallback when IEM has
+        insufficient coverage (< 25% of requested days).
     Returns one DailyObservation per day in the range.
     """
     raw_rows = await _fetch_raw(
@@ -85,10 +92,96 @@ async def fetch_daily_observations(
         data_vars=["tmpf", "dwpf", "relh", "drct", "sknt", "p01i"],
     )
 
-    if not raw_rows:
-        return []
+    iem_obs = _aggregate_to_daily(station_id, raw_rows) if raw_rows else []
 
-    return _aggregate_to_daily(station_id, raw_rows)
+    expected_days = (end_date - start_date).days + 1
+    coverage = len(iem_obs) / expected_days if expected_days > 0 else 0.0
+
+    if coverage >= _MIN_IEM_COVERAGE:
+        return iem_obs
+
+    # IEM returned thin data — fall back to ERA5 reanalysis if coords supplied
+    if latitude is not None and longitude is not None:
+        log.info(
+            "IEM coverage %.0f%% for %s — falling back to ERA5 reanalysis",
+            coverage * 100, station_id,
+        )
+        era5_obs = await fetch_daily_observations_era5(
+            station_id, latitude, longitude, start_date, end_date
+        )
+        if era5_obs:
+            return era5_obs
+
+    return iem_obs
+
+
+async def fetch_daily_observations_era5(
+    station_id: str,
+    latitude: float,
+    longitude: float,
+    start_date: date,
+    end_date: date,
+) -> list[DailyObservation]:
+    """
+    Fetch daily max/min temperature from Open-Meteo ERA5 reanalysis archive.
+
+    Free, no API key, global coverage back to 1940.
+    Used as fallback when IEM ASOS has insufficient data for international stations.
+    """
+    lat_r = round(latitude, 4)
+    lon_r = round(longitude, 4)
+    cache_k = _cache_key(
+        "era5", station_id, str(lat_r), str(lon_r),
+        start_date.isoformat(), end_date.isoformat(),
+    )
+    cached = _read_cache(cache_k)
+    if cached is not None:
+        log.info("Loaded ERA5 obs from cache for %s (%s to %s)", station_id, start_date, end_date)
+        daily_json = cached
+    else:
+        params = {
+            "latitude": lat_r,
+            "longitude": lon_r,
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum",
+            "timezone": "UTC",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.get(ERA5_BASE, params=params)
+                resp.raise_for_status()
+                daily_json = resp.json()
+                _write_cache(cache_k, daily_json)
+        except Exception as exc:
+            log.warning("ERA5 fetch failed for %s: %s", station_id, exc)
+            return []
+
+    daily = daily_json.get("daily", {})
+    times = daily.get("time", [])
+    tmax_vals = daily.get("temperature_2m_max", [])
+    tmin_vals = daily.get("temperature_2m_min", [])
+    precip_vals = daily.get("precipitation_sum", [])
+
+    observations: list[DailyObservation] = []
+    for i, date_str in enumerate(times):
+        try:
+            d = date.fromisoformat(date_str)
+        except ValueError:
+            continue
+        tmax = tmax_vals[i] if i < len(tmax_vals) else None
+        tmin = tmin_vals[i] if i < len(tmin_vals) else None
+        precip = precip_vals[i] if i < len(precip_vals) else None
+        observations.append(DailyObservation(
+            station_id=station_id,
+            date=d,
+            tmax_c=float(tmax) if tmax is not None else None,
+            tmin_c=float(tmin) if tmin is not None else None,
+            precip_mm=float(precip) if precip is not None else None,
+        ))
+
+    log.info("ERA5 returned %d daily obs for %s", len(observations), station_id)
+    return observations
 
 
 async def fetch_hourly_observations(

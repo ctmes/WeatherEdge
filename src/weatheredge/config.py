@@ -122,6 +122,17 @@ NON_WEATHER_BLOCKLIST: list[str] = [
 
 PMXT_ARCHIVE_BASE = "https://r2.pmxt.dev"
 
+
+# ---------------------------------------------------------------------------
+# Telonex
+# ---------------------------------------------------------------------------
+
+TELONEX_BASE = "https://api.telonex.io/v1"
+TELONEX_API_KEY: str = os.getenv(
+    "TELONEX_API_KEY",
+    "tlx_9b519bd1aaa0d3955110abbe7458113a",
+)
+
 # Slug / title fragments used to identify weather markets in pmxt archive data.
 # Applied case-insensitively against market_slug and title columns.
 PMXT_WEATHER_SLUGS: list[str] = [

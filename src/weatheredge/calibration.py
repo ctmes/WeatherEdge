@@ -306,7 +306,7 @@ def pair_observations_with_forecasts(
 
 async def run_calibration(
     station_id: str,
-    days: int = 365,
+    days: int = 1825,
     end_date: date | None = None,
 ) -> tuple[StationBias, dict[str, Any]]:
     """
@@ -331,7 +331,7 @@ async def run_calibration(
     end = end_date or (date.today() - timedelta(days=1))
     
     ck = _cache_key("calibration", station_id, str(days), end.isoformat())
-    cached = read_cache(_SUBDIR, ck, max_age_hours=24.0)
+    cached = read_cache(_SUBDIR, ck, max_age_hours=None)  # permanent: key encodes end_date
     if cached is not None:
         try:
             bias_dict = cached["bias"]
@@ -348,7 +348,10 @@ async def run_calibration(
     start = end - timedelta(days=days)
 
     logger.info("Fetching %d days of data for %s...", days, station_id)
-    observations = await fetch_daily_observations(station_id, start, end)
+    observations = await fetch_daily_observations(
+        station_id, start, end,
+        latitude=station.latitude, longitude=station.longitude,
+    )
 
     if not observations:
         return StationBias(station_id=station_id), {"error": "No observations found"}

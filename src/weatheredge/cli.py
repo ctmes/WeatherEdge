@@ -144,8 +144,8 @@ def main() -> None:
         help="ICAO station ID to calibrate (e.g. NZWN, KORD)",
     )
     cal_parser.add_argument(
-        "--days", type=int, default=365,
-        help="Number of historical days to fetch (default: 365)",
+        "--days", type=int, default=1825,
+        help="Number of historical days to fetch (default: 1825 = 5 years)",
     )
     cal_parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable debug logging",
@@ -235,8 +235,8 @@ def main() -> None:
         "calibrate-all", help="Run calibration for all supported stations",
     )
     cal_all_parser.add_argument(
-        "--days", type=int, default=365,
-        help="Number of days of history to use (default: 365)",
+        "--days", type=int, default=1825,
+        help="Number of days of history to use (default: 1825 = 5 years)",
     )
 
     # -- backtest -----------------------------------------------------

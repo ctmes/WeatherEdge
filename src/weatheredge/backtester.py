@@ -398,6 +398,16 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
             # Skip global climate anomaly markets — not city-level temperature
             if parsed.station_id == "GLOBAL":
                 log.debug("Skipping global climate market: %s", parsed.question[:60])
+
+            # In full_sim mode with --source clob, skip markets where the CLOB
+            # prices-history API had no data (too far in the past). Proceeding
+            # with Gamma's post-resolution prices (1.0 / 0.0 / 0.0 …) would
+            # produce only zero_price_bins and no signals — skip explicitly.
+            if not brier_only and raw.get("_clob_no_data"):
+                log.info(
+                    "Skipping %s — no CLOB price history available (market too old)",
+                    parsed.question[:60],
+                )
                 continue
 
 

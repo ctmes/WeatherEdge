@@ -16,7 +16,13 @@
       "Bash(python -m weatheredge backtest --start 2026-03-09 --end 2026-03-09 --source gamma --mode brier_only)",
       "Bash(timeout 60 python -m weatheredge backtest --start 2026-03-09 --end 2026-03-09 --source clob --mode full_sim)",
       "Bash(python -m weatheredge backtest --start 2026-03-09 --end 2026-03-09 --source clob --mode full_sim)",
-      "Bash(grep -E \"model vs|Fill:|Backtesting|market$|ERROR|Warning|clob\")"
+      "Bash(grep -E \"model vs|Fill:|Backtesting|market$|ERROR|Warning|clob\")",
+      "Read(//Users/colin/.weatheredge/**)",
+      "Read(//Users/colin/.weatheredge/calibration_cache/**)",
+      "Read(//Users/colin/.weatheredge/mesonet_cache/**)",
+      "Read(//Users/colin/.weatheredge/backtest_cache/**)",
+      "Bash(python3 -c \":*)",
+      "Bash(python3:*)"
     ]
   }
 }

@@ -158,6 +158,10 @@ async def fetch_resolved_markets(
                 for raw_item in day_raw:
                     parsed = _raw_to_parsed_market(raw_item)
                     if parsed:
+                        # Skip global climate anomaly markets — not city-level temperature
+                        if parsed.station_id == "GLOBAL":
+                            log.debug("Skipping global climate market: %s", parsed.question[:60])
+                            continue
                         all_pairs.append((parsed, raw_item))
             pbar.update(len(batch))
 
@@ -504,6 +508,8 @@ async def fetch_historical_forecast_ensemble(
 async def fetch_clob_price_at_time(
     token_id: str,
     target_dt: datetime,
+    *,
+    condition_id: str = "",
 ) -> float | None:
     """
     Fetch the Polymarket CLOB midpoint price for a single token at or just
@@ -539,23 +545,41 @@ async def fetch_clob_price_at_time(
             return None
 
     if not history:
-        return None
+        # Fall through to Telonex below
+        best_price = None
+    else:
+        # history is sorted ascending by timestamp — walk forward and keep the
+        # last price at or before target_dt.
+        target_ts = int(target_dt.timestamp())
+        best_price: float | None = None
+        for entry in history:
+            t = entry.get("t", 0)
+            p = entry.get("p")
+            if p is None:
+                continue
+            if t <= target_ts:
+                best_price = float(p)
+            else:
+                break  # past target time — stop
 
-    # history is sorted ascending by timestamp — walk forward and keep the
-    # last price at or before target_dt.
-    target_ts = int(target_dt.timestamp())
-    best_price: float | None = None
-    for entry in history:
-        t = entry.get("t", 0)
-        p = entry.get("p")
-        if p is None:
-            continue
-        if t <= target_ts:
-            best_price = float(p)
-        else:
-            break  # past target time — stop
+    if best_price is not None:
+        return best_price
 
-    return best_price
+    # ── Telonex fallback ────────────────────────────────────────────────────
+    # CLOB prices-history has a rolling retention window of roughly 6 months.
+    # For older markets, fall back to Telonex tick trades (~39% coverage for
+    # 2024-2025 weather markets).
+    try:
+        from weatheredge.telonex_fetcher import fetch_telonex_price_at_time
+        telonex_price = await fetch_telonex_price_at_time(
+            token_id, target_dt, condition_id=condition_id
+        )
+        if telonex_price is not None:
+            return telonex_price
+    except Exception as e:
+        log.debug("Telonex fallback error for token %s: %s", token_id[:12], e)
+
+    return None
 
 
 async def fetch_clob_resolved_markets(
@@ -613,12 +637,20 @@ async def fetch_clob_resolved_markets(
             enriched_pairs.append((parsed, raw))
             continue
 
-        # Decision time: 00:00 UTC on the resolution date.
-        decision_dt = datetime(res_date.year, res_date.month, res_date.day, 0, 0, 0)
+        # Decision time: 18:00 UTC on the day BEFORE resolution.
+        # Using midnight (00:00) on the resolution day would capture prices
+        # after same-day weather observations have started coming in for
+        # UTC+ timezones, creating look-ahead bias. 18:00 UTC the prior day
+        # is solidly before any observations while still being a liquid
+        # trading window for most markets.
+        decision_dt = datetime(res_date.year, res_date.month, res_date.day, 18, 0, 0) - timedelta(days=1)
 
         # Fetch prices for all bins of this market concurrently.
         prices_raw = await asyncio.gather(
-            *[fetch_clob_price_at_time(tid, decision_dt) for tid in token_ids]
+            *[
+                fetch_clob_price_at_time(tid, decision_dt, condition_id=parsed.condition_id)
+                for tid in token_ids
+            ]
         )
 
         new_prices = [float(p) if p is not None else 0.0 for p in prices_raw]
@@ -630,14 +662,17 @@ async def fetch_clob_resolved_markets(
         else:
             log.warning(
                 "CLOB prices-history returned no data for any bin of %s (%s) — "
-                "prices will be 0.0 → floored to 1%% by normalisation",
+                "market will be skipped in full_sim mode (no pre-resolution prices available)",
                 parsed.condition_id, parsed.question[:40],
             )
+            raw["_clob_no_data"] = True
 
         enriched_pairs.append((parsed, raw))
 
+    clob_pairs = [(p, r) for p, r in enriched_pairs if "_clob_prices" in r]
+    dropped = len(enriched_pairs) - len(clob_pairs)
     log.info(
-        "CLOB enrichment: %d/%d markets got real pre-resolution prices",
-        enriched_count, len(all_pairs),
+        "CLOB enrichment: %d/%d markets got real pre-resolution prices (%d dropped — too old or no CLOB history)",
+        len(clob_pairs), len(all_pairs), dropped,
     )
-    return enriched_pairs
+    return clob_pairs
