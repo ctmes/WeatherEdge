@@ -60,8 +60,9 @@ def _get_open_meteo_sem() -> asyncio.Semaphore:
 # ---------------------------------------------------------------------------
 # Each prices-history response can be several MB of JSON.  With 991 markets
 # (up to 9 bins each) fetching concurrently this quickly exhausts the 961 MB
-# VPS RAM.  Cap at 20 simultaneous fetches — fast enough (network-bound) but
-# keeps peak resident set well under the memory limit.
+# VPS RAM.  Cap at 3 simultaneous fetches — still fast (network-bound) while
+# keeping peak resident set to ~3 full histories at a time (~15-30 MB max).
+# Previously 20, which caused 100+ MB of concurrent JSON to be held in memory.
 
 _clob_ph_sems: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
 
@@ -69,7 +70,7 @@ _clob_ph_sems: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
 def _get_clob_ph_sem() -> asyncio.Semaphore:
     loop = asyncio.get_running_loop()
     if loop not in _clob_ph_sems:
-        _clob_ph_sems[loop] = asyncio.Semaphore(20)
+        _clob_ph_sems[loop] = asyncio.Semaphore(3)
     return _clob_ph_sems[loop]
 
 
@@ -580,6 +581,8 @@ async def fetch_clob_price_at_time(
                 best_price = float(p)
             else:
                 break  # past target time — stop
+        # Free the multi-MB history list immediately — no longer needed.
+        del history
 
     if best_price is not None:
         return best_price
@@ -664,13 +667,15 @@ async def fetch_clob_resolved_markets(
         # trading window for most markets.
         decision_dt = datetime(res_date.year, res_date.month, res_date.day, 18, 0, 0) - timedelta(days=1)
 
-        # Fetch prices for all bins of this market concurrently.
-        prices_raw = await asyncio.gather(
-            *[
-                fetch_clob_price_at_time(tid, decision_dt, condition_id=parsed.condition_id)
-                for tid in token_ids
-            ]
-        )
+        # Fetch prices for bins SEQUENTIALLY within each market.
+        # Previously used asyncio.gather() which held up to 9 full token
+        # histories in memory simultaneously (each several MB).  Sequential
+        # fetching means at most 1 history in memory per market at a time.
+        # Disk-cached bins get no penalty; only uncached markets are slower.
+        prices_raw = []
+        for tid in token_ids:
+            p = await fetch_clob_price_at_time(tid, decision_dt, condition_id=parsed.condition_id)
+            prices_raw.append(p)
 
         new_prices = [float(p) if p is not None else 0.0 for p in prices_raw]
 

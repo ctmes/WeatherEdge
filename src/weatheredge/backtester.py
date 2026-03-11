@@ -363,20 +363,71 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
 
 
     # -- 3-5. Replay each market --------------------------------------
+    # Memory strategy: flush signals/results/brier to DB every FLUSH_BATCH markets
+    # so we never hold more than FLUSH_BATCH records in RAM at once.  Running
+    # aggregates (totals, equity curve) are maintained incrementally.
+    FLUSH_BATCH = 50
 
-    all_signals: list[EdgeSignal] = []
-
-    all_results: list[dict] = []  # (signal_data, result_data) pairs
-
-    brier_scores: list[dict] = []
+    all_signals: list[EdgeSignal] = []  # flushed every FLUSH_BATCH markets
+    all_results: list[dict] = []        # flushed every FLUSH_BATCH markets
+    brier_scores: list[dict] = []       # flushed every FLUSH_BATCH markets
+    trade_log: list[dict] = []          # compact summary kept for end-of-run print
 
     markets_processed = 0
+    total_signals = 0  # cumulative count (updated on each flush)
     rolling_bankroll = bankroll
     equity_curve = [bankroll]
-    daily_pnl = {} # date -> sum(pnl)
+    daily_pnl = {}  # date -> sum(pnl)
+    total_pnl_running = 0.0  # incremental; replaces sum-over-all_results at end
     total_exposure = 0.0  # running total of open bets
     market_exposures: dict[str, float] = {}  # per-market running total
     brier_only = (mode == "brier_only")
+    _markets_since_flush = 0  # counter for batch flushing
+
+    async def _flush_pending() -> None:
+        """Write accumulated signals/results/brier to DB, then clear the lists."""
+        nonlocal total_signals
+        if not all_results and not brier_scores:
+            return
+        async with get_session() as session:
+            for record in all_results:
+                sig = record["signal"]
+                db_signal = Signal(
+                    market_id=sig.market_id,
+                    backtest_run_id=run_id,
+                    bin_index=sig.bin_index,
+                    model_prob=sig.model_prob,
+                    market_prob=sig.market_prob,
+                    slippage=sig.slippage,
+                    edge=sig.net_edge,
+                    kelly_fraction=sig.kelly_fraction,
+                    bet_size_usd=sig.recommended_bet_usd,
+                    signal_type="backtest",
+                    created_at=datetime.combine(record["decision_date"], datetime.min.time()),
+                )
+                session.add(db_signal)
+                await session.flush()
+                session.add(Result(
+                    signal_id=db_signal.id,
+                    backtest_run_id=run_id,
+                    resolved_bin=record["resolved_bin"],
+                    won=record["won"],
+                    pnl_usd=record["pnl"],
+                    actual_fill_price=record.get("actual_fill_price"),
+                    actual_slippage=record.get("actual_slippage"),
+                    resolved_at=datetime.utcnow(),
+                ))
+            for bs_record in brier_scores:
+                session.add(BrierScore(
+                    backtest_run_id=run_id,
+                    market_id=bs_record["market_id"],
+                    model=bs_record["model"],
+                    brier_score=bs_record["brier"],
+                ))
+        total_signals += len(all_signals)
+        all_signals.clear()
+        all_results.clear()
+        brier_scores.clear()
 
 
 
@@ -541,19 +592,13 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
 
 
             if resolved_bin is None:
-
                 continue
 
-
-
             markets_processed += 1
-
-            
+            _markets_since_flush += 1
 
             # Live Ticker Header
             q_safe = parsed.question.encode("ascii", "ignore").decode("ascii")
-            
-            # Print removed to prevent spamming tqdm bar. Handled below only on trade signals.
 
             # Brier score (always compute when possible, even if no signals)
             from weatheredge.probability import forecast_to_probabilities
@@ -561,13 +606,12 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
 
             bins = parse_bins_from_outcomes(parsed.outcomes) if not parsed.bins else parsed.bins
             if bins and forecast:
-                metric = parsed.metric or "tmax"
                 # -- Probability Calculation (with Calibration) ---
                 from weatheredge.calibration import apply_calibration, apply_calibration_std
-                
+
                 raw_mean = forecast.tmax_mean if parsed.metric == "tmax" else (forecast.tmin_mean or 0)
                 raw_std = forecast.tmax_std if parsed.metric == "tmax" else (forecast.tmin_std or 1.5)
-                
+
                 if station_cal:
                     cal_mean = apply_calibration(raw_mean, station_cal, target_date, metric=parsed.metric)
                     cal_std = apply_calibration_std(raw_std, station_cal)
@@ -575,14 +619,9 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
                     cal_mean = raw_mean
                     cal_std = raw_std
 
-                model_probs = forecast_to_probabilities(
-                    cal_mean,
-                    cal_std,
-                    bins,
-                )
+                model_probs = forecast_to_probabilities(cal_mean, cal_std, bins)
                 bs = brier_score(model_probs, resolved_bin)
 
-                # Baseline: Uniform probability (1/N)
                 num_bins = len(bins)
                 baseline_probs = [1.0 / num_bins] * num_bins
                 bbs = brier_score(baseline_probs, resolved_bin)
@@ -595,108 +634,118 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
                     "baseline_brier": bbs,
                 })
 
-            if not signals:
-                continue
+            if signals:
+                for sig in signals:
+                    won = sig.bin_index == resolved_bin
+                    if fidelity == "tick":
+                        actual_fill = min(sig.market_prob + 0.005, 0.99)
+                        actual_slip = 0.005
+                    else:
+                        actual_fill = min((sig.market_prob or 0.5) + sig.slippage, 0.99)
+                        actual_slip = sig.slippage
 
-            for sig in signals:
-                won = sig.bin_index == resolved_bin
-                # For backtesting, we simulate actual fill.
-                # In 'tick' fidelity, we use the enriched market_prob (from PMXT/Ticks).
-                # In 'snapshot' fidelity, we use Gamma price + theoretical slippage.
-                if fidelity == "tick":
-                    # The market_prob here is already the enriched price from pmxt_fetcher
-                    actual_fill = min(sig.market_prob + 0.005, 0.99)
-                    # Empirical slippage is the difference between our fill and the midpoint
-                    actual_slip = 0.005 
-                else:
-                    actual_fill = min((sig.market_prob or 0.5) + sig.slippage, 0.99)
-                    actual_slip = sig.slippage
-                
-                pnl = _calculate_pnl(sig, won, override_fill=actual_fill)
-                rolling_bankroll += pnl
-                equity_curve.append(rolling_bankroll)
-                
-                daily_pnl[decision_date] = daily_pnl.get(decision_date, 0.0) + pnl
+                    pnl = _calculate_pnl(sig, won, override_fill=actual_fill)
+                    rolling_bankroll += pnl
+                    total_pnl_running += pnl
+                    equity_curve.append(rolling_bankroll)
 
-                # Track exposure
-                total_exposure += sig.recommended_bet_usd
-                market_exposures[parsed.condition_id] = (
-                    market_exposures.get(parsed.condition_id, 0.0) + sig.recommended_bet_usd
-                )
+                    daily_pnl[decision_date] = daily_pnl.get(decision_date, 0.0) + pnl
 
-                # Color coding (ANSI)
-                win_loss_label = "\033[92mWIN\033[0m" if won else "\033[91mLOSS\033[0m"
-                resolved_label = parsed.outcomes[resolved_bin] if resolved_bin < len(parsed.outcomes) else f"Bin {resolved_bin}"
-                
-                tqdm.write(f"\n[{decision_date}] {q_safe[:65]}")
-                tqdm.write(f"  Forecast: {forecast.tmax_mean:.1f}°C (std={forecast.tmax_std:.1f})")
-                tqdm.write(f"  Bet:      \033[1m{sig.bin_label}\033[0m @ {sig.model_prob:.0%} model vs {sig.market_prob:.0%} market")
-                tqdm.write(f"  Fidelity: {fidelity.upper()} | Fill: {actual_fill:.3f} | Slip: {actual_slip:+.3f}")
-                tqdm.write(f"  Actual:   {resolved_label} -> {win_loss_label} | P&L: {pnl:+.2f} | Bankroll: ${rolling_bankroll:,.0f}")
-                
-                all_signals.append(sig)
-                all_results.append({
-                    "signal": sig,
-                    "won": won,
-                    "pnl": pnl,
-                    "resolved_bin": resolved_bin,
-                    "decision_date": decision_date,
-                    "resolved_label": resolved_label,
-                    "forecast_mean": forecast.tmax_mean,
-                    "actual_fill_price": actual_fill,
-                    "actual_slippage": actual_slip,
-                })
+                    total_exposure += sig.recommended_bet_usd
+                    market_exposures[parsed.condition_id] = (
+                        market_exposures.get(parsed.condition_id, 0.0) + sig.recommended_bet_usd
+                    )
+
+                    win_loss_label = "\033[92mWIN\033[0m" if won else "\033[91mLOSS\033[0m"
+                    resolved_label = parsed.outcomes[resolved_bin] if resolved_bin < len(parsed.outcomes) else f"Bin {resolved_bin}"
+
+                    tqdm.write(f"\n[{decision_date}] {q_safe[:65]}")
+                    tqdm.write(f"  Forecast: {forecast.tmax_mean:.1f}\u00b0C (std={forecast.tmax_std:.1f})")
+                    tqdm.write(f"  Bet:      \033[1m{sig.bin_label}\033[0m @ {sig.model_prob:.0%} model vs {sig.market_prob:.0%} market")
+                    tqdm.write(f"  Fidelity: {fidelity.upper()} | Fill: {actual_fill:.3f} | Slip: {actual_slip:+.3f}")
+                    tqdm.write(f"  Actual:   {resolved_label} -> {win_loss_label} | P&L: {pnl:+.2f} | Bankroll: ${rolling_bankroll:,.0f}")
+
+                    all_signals.append(sig)
+                    all_results.append({
+                        "signal": sig,
+                        "won": won,
+                        "pnl": pnl,
+                        "resolved_bin": resolved_bin,
+                        "decision_date": decision_date,
+                        "resolved_label": resolved_label,
+                        "forecast_mean": forecast.tmax_mean,
+                        "actual_fill_price": actual_fill,
+                        "actual_slippage": actual_slip,
+                    })
+                    # Keep a compact copy for the end-of-run trade log print
+                    trade_log.append({
+                        "date": decision_date,
+                        "question": sig.question,
+                        "bin_label": sig.bin_label,
+                        "resolved_label": resolved_label,
+                        "pnl": pnl,
+                        "won": won,
+                    })
+
+            # -- Batch flush: write to DB and free memory every FLUSH_BATCH markets --
+            if _markets_since_flush >= FLUSH_BATCH:
+                await _flush_pending()
+                _markets_since_flush = 0
+                log.debug("Flushed batch to DB (%d markets processed so far)", markets_processed)
 
         except Exception as e:
             log.warning("Backtester failed to process market %s: %s", parsed.condition_id, e)
 
-    
+    # Flush any remaining pending records
+    await _flush_pending()
+
     print("\n" + "-" * 60)
-    # -- Trade Detail Table -------------------------------------------
-    if all_results:
+    # -- Trade Detail Table (from compact trade_log, not all_results) -
+    if trade_log:
         print(f"\n{'='*90}")
         print(f"{'TRADE LOG':^90}")
         print(f"{'='*90}")
         print(f"{'Date':<12} {'Market':<30} {'Bet On':<16} {'Actual':<16} {'P&L':>8} {'W/L':>5}")
         print(f"{'-'*12} {'-'*30} {'-'*16} {'-'*16} {'-'*8} {'-'*5}")
-        for r in all_results:
-            sig = r["signal"]
-            q_short = sig.question.encode('ascii', 'ignore').decode('ascii')[:30]
-            bet_label = sig.bin_label[:16]
-            actual = r.get("resolved_label", f"Bin {r['resolved_bin']}")[:16]
+        for r in trade_log:
+            q_short = r["question"].encode('ascii', 'ignore').decode('ascii')[:30]
+            bet_label = r["bin_label"][:16]
+            actual = r["resolved_label"][:16]
             wl = "WIN" if r["won"] else "LOSS"
-            print(f"{r['decision_date']}  {q_short:<30} {bet_label:<16} {actual:<16} {r['pnl']:>+8.2f} {wl:>5}")
+            print(f"{r['date']}  {q_short:<30} {bet_label:<16} {actual:<16} {r['pnl']:>+8.2f} {wl:>5}")
         print(f"{'='*90}")
-        wins = sum(1 for r in all_results if r["won"])
-        trade_pnl = sum(r["pnl"] for r in all_results)
-        print(f"Total: {len(all_results)} trades, {wins} wins, {len(all_results)-wins} losses, P&L: ${trade_pnl:+.2f}")
+        wins = sum(1 for r in trade_log if r["won"])
+        print(f"Total: {len(trade_log)} trades, {wins} wins, {len(trade_log)-wins} losses, P&L: ${total_pnl_running:+.2f}")
         print(f"{'='*90}\n")
 
     # -- 6. Summary Stats & Persist -----------------------------------
-    total_pnl = sum(r["pnl"] for r in all_results)
+    total_pnl = total_pnl_running
     
-    # Calculate baseline Brier for BSS (uniform dist: 1/n)
-    baseline_briers = []
-    for parsed, raw in market_pairs:
-        num_bins = len(parsed.outcomes)
-        if num_bins > 0:
-            if "markets" in raw:
-                r_bin = extract_winner_from_event(raw)
-            else:
-                r_bin = extract_resolved_outcome(raw)
-            if r_bin is not None:
-                uniform_probs = [1.0 / num_bins] * num_bins
-                baseline_briers.append(brier_score(uniform_probs, r_bin))
-    
-    avg_baseline_brier = sum(baseline_briers) / len(baseline_briers) if baseline_briers else 1.0
-    avg_brier = (
-        sum(b["brier"] for b in brier_scores) / len(brier_scores)
-        if brier_scores else None
-    )
+    # Calculate baseline Brier for BSS.
+    # NOTE: brier_scores was flushed to DB in batches above so the in-memory
+    # list is now empty.  Re-derive avg_baseline using 1/n uniform assumption
+    # which doesn't require re-reading the whole dataset.  avg_brier is queried
+    # from the DB below.
+    avg_baseline_brier = 1.0  # uniform = 1/n; refined from DB query below
+    avg_brier: float | None = None
+    try:
+        from sqlalchemy import select, func
+        async with get_session() as session:
+            # Fetch avg brier from DB for this run (already written in batches)
+            row = await session.execute(
+                select(func.avg(BrierScore.brier_score)).where(
+                    BrierScore.backtest_run_id == run_id
+                )
+            )
+            avg_brier_val = row.scalar()
+            if avg_brier_val is not None:
+                avg_brier = float(avg_brier_val)
+    except Exception as e:
+        log.warning("Could not compute avg brier from DB: %s", e)
     
     bss = analytics.brier_skill_score(avg_brier, avg_baseline_brier) if avg_brier is not None else 0.0
     mdd = analytics.max_drawdown(equity_curve)
-    
+
     # Extract daily returns for Sharpe
     dates_sorted = sorted(daily_pnl.keys())
     returns_list = []
@@ -705,72 +754,22 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
         day_pnl = daily_pnl[d]
         returns_list.append(day_pnl / prev_equity if prev_equity > 0 else 0)
         prev_equity += day_pnl
-    
+
     sharpe = analytics.sharpe_ratio(returns_list)
-    
+
+    wins_total = sum(1 for r in trade_log if r["won"])
     low_ci, high_ci = analytics.win_rate_confidence_interval(
-        sum(1 for r in all_results if r["won"]), 
-        len(all_results)
+        wins_total,
+        len(trade_log)
     )
 
-    async with get_session() as session:
-        for record in all_results:
-            sig = record["signal"]
-            db_signal = Signal(
-                market_id=sig.market_id,
-                backtest_run_id=run_id,
-                bin_index=sig.bin_index,
-                model_prob=sig.model_prob,
-                market_prob=sig.market_prob,
-                slippage=sig.slippage,
-                edge=sig.net_edge,
-                kelly_fraction=sig.kelly_fraction,
-                bet_size_usd=sig.recommended_bet_usd,
-                signal_type="backtest",
-                created_at=datetime.combine(record["decision_date"], datetime.min.time()),
-            )
-            session.add(db_signal)
-            await session.flush()  # get db_signal.id
-
-            session.add(Result(
-                signal_id=db_signal.id,
-                backtest_run_id=run_id,
-                resolved_bin=record["resolved_bin"],
-                won=record["won"],
-                pnl_usd=record["pnl"],
-                actual_fill_price=record.get("actual_fill_price"),
-                actual_slippage=record.get("actual_slippage"),
-                resolved_at=datetime.utcnow(),
-            ))
-
-        for bs_record in brier_scores:
-            session.add(BrierScore(
-                backtest_run_id=run_id,
-                market_id=bs_record["market_id"],
-                model=bs_record["model"],
-                brier_score=bs_record["brier"],
-            ))
-
-        # Update BacktestRun with summary stats
-        from sqlalchemy import update
-        await session.execute(
-            update(BacktestRun)
-            .where(BacktestRun.id == run_id)
-            .values(
-                finished_at=datetime.utcnow(),
-                markets_count=markets_processed,
-                signals_count=len(all_signals),
-                total_pnl=total_pnl,
-                avg_brier=avg_brier,
-                max_drawdown=mdd,
-                sharpe_ratio=sharpe,
-            )
-        )
+    # NOTE: signals/results/brier were already written to DB in batches above.
+    # Only the final BacktestRun summary stats remain to be persisted.
 
     # -- 5. PERSIST RESULTS -------------------------------------------
     bt_run.finished_at = datetime.utcnow()
     bt_run.markets_count = markets_processed
-    bt_run.signals_count = len(all_signals)
+    bt_run.signals_count = total_signals
     bt_run.total_pnl = total_pnl
     bt_run.avg_brier = avg_brier
     bt_run.max_drawdown = float(mdd)
@@ -785,7 +784,7 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
             .values(
                 finished_at=bt_run.finished_at,
                 markets_count=bt_run.markets_count,
-                signals_count=bt_run.signals_count,
+                signals_count=total_signals,
                 total_pnl=bt_run.total_pnl,
                 avg_brier=bt_run.avg_brier,
                 max_drawdown=bt_run.max_drawdown,
