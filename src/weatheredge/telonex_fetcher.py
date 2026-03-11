@@ -106,7 +106,10 @@ async def _load_markets_metadata() -> dict[str, str]:
 
         try:
             import pandas as pd
-            df = pd.read_parquet(BytesIO(content))
+            # Only read the 4 columns we need — avoids loading the full parquet
+            # schema (which can be 50+ columns) and cuts peak RAM significantly.
+            needed_cols = ["slug", "market_id", "asset_id_0", "trades_from"]
+            df = pd.read_parquet(BytesIO(content), columns=needed_cols)
 
             # Only keep rows that have trades data
             has_trades = df["trades_from"].notna() & (df["trades_from"] != "")
@@ -124,6 +127,7 @@ async def _load_markets_metadata() -> dict[str, str]:
                 if aid:
                     lookup[aid] = slug
 
+            del df  # free DataFrame memory immediately after building lookup
             write_cache(_SUBDIR, disk_key, lookup)
             _markets_cache = lookup
             _markets_loaded_at = now
