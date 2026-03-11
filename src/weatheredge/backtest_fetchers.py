@@ -489,7 +489,14 @@ async def fetch_historical_ecmwf_ensemble(
     cache_k = _cache_key("ecmwf_ens51", str(lat_r), str(lon_r), valid_date.isoformat())
     cached = _read_cache(cache_k)
 
-    if cached is None:
+    # Sentinel written when the API returns a permanent error (e.g. 400) so
+    # subsequent runs skip the API call immediately instead of repeating it.
+    _SENTINEL = {"_no_data": True}
+
+    if cached is not None:
+        if cached.get("_no_data"):
+            return None
+    else:
         # ECMWF IFS ensemble: control (00) + 50 perturbed members
         member_vars = ",".join(
             f"temperature_2m_max_member{i:02d}" for i in range(51)
@@ -519,6 +526,17 @@ async def fetch_historical_ecmwf_ensemble(
                         )
                         await asyncio.sleep(wait)
                         continue
+                    if resp.status_code in (400, 404, 422):
+                        # Permanent client error — this model/variable combo is
+                        # not supported by this API endpoint. Cache the sentinel
+                        # so we never hit the API again for this key.
+                        log.warning(
+                            "ECMWF ensemble API returned %d for %s %s — "
+                            "caching sentinel, falling back to multi-model spread.",
+                            resp.status_code, lat_r, lon_r,
+                        )
+                        _write_cache(cache_k, _SENTINEL)
+                        return None
                     resp.raise_for_status()
                     cached = resp.json()
                     _write_cache(cache_k, cached)
@@ -530,7 +548,7 @@ async def fetch_historical_ecmwf_ensemble(
             )
             return None
 
-    if cached is None:
+    if cached is None or cached.get("_no_data"):
         return None
 
     daily = cached.get("daily", {})
