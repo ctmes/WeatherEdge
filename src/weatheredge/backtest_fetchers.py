@@ -56,6 +56,24 @@ def _get_open_meteo_sem() -> asyncio.Semaphore:
 
 
 # ---------------------------------------------------------------------------
+# CLOB prices-history concurrency semaphore
+# ---------------------------------------------------------------------------
+# Each prices-history response can be several MB of JSON.  With 991 markets
+# (up to 9 bins each) fetching concurrently this quickly exhausts the 961 MB
+# VPS RAM.  Cap at 20 simultaneous fetches — fast enough (network-bound) but
+# keeps peak resident set well under the memory limit.
+
+_clob_ph_sems: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
+
+
+def _get_clob_ph_sem() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    if loop not in _clob_ph_sems:
+        _clob_ph_sems[loop] = asyncio.Semaphore(20)
+    return _clob_ph_sems[loop]
+
+
+# ---------------------------------------------------------------------------
 # Cache helpers
 # ---------------------------------------------------------------------------
 
@@ -531,12 +549,13 @@ async def fetch_clob_price_at_time(
         url = f"{POLYMARKET_CLOB_BASE}/prices-history"
         params = {"market": token_id, "interval": "max", "fidelity": 1}
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.get(url, params=params)
-                resp.raise_for_status()
-                data = resp.json()
-                history = data.get("history", [])
-                _write_cache(cache_k, history)
+            async with _get_clob_ph_sem():  # cap concurrent in-flight responses
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.get(url, params=params)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    history = data.get("history", [])
+                    _write_cache(cache_k, history)
         except Exception as e:
             log.warning(
                 "CLOB prices-history fetch failed for token %s...%s: %s",
