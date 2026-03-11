@@ -463,6 +463,112 @@ async def fetch_historical_forecast(
     )
 
 
+async def fetch_historical_ecmwf_ensemble(
+    latitude: float,
+    longitude: float,
+    valid_date: date,
+    *,
+    timezone: str = "auto",
+    decision_date: date | None = None,
+) -> ForecastResult | None:
+    """
+    Fetch all 51 ECMWF IFS ensemble members from the historical forecast API
+    and derive mean/std from actual member spread.
+
+    This gives the real forecast uncertainty that was available at the time —
+    not a fixed heuristic. Cached by (lat, lon, date) so reruns are free.
+
+    Falls back to None if the API doesn't return at least 3 members, allowing
+    the caller to fall back to the multi-model deterministic ensemble.
+    """
+    import numpy as np
+
+    lat_r = round(latitude, 4)
+    lon_r = round(longitude, 4)
+
+    cache_k = _cache_key("ecmwf_ens51", str(lat_r), str(lon_r), valid_date.isoformat())
+    cached = _read_cache(cache_k)
+
+    if cached is None:
+        # ECMWF IFS ensemble: control (00) + 50 perturbed members
+        member_vars = ",".join(
+            f"temperature_2m_max_member{i:02d}" for i in range(51)
+        )
+        params: dict = {
+            "latitude": lat_r,
+            "longitude": lon_r,
+            "daily": member_vars,
+            "timezone": timezone,
+            "start_date": valid_date.isoformat(),
+            "end_date": valid_date.isoformat(),
+            "models": "ecmwf_ifs_ensemble",
+        }
+        if OPEN_METEO_API_KEY:
+            params["apikey"] = OPEN_METEO_API_KEY
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                for attempt in range(5):
+                    async with _get_open_meteo_sem():
+                        resp = await client.get(OPEN_METEO_HISTORICAL, params=params)
+                    if resp.status_code == 429:
+                        wait = (2 ** attempt) + 1
+                        log.warning(
+                            "Open-Meteo rate limited (429). Retrying in %ds (attempt %d/5).",
+                            wait, attempt + 1,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+                    resp.raise_for_status()
+                    cached = resp.json()
+                    _write_cache(cache_k, cached)
+                    break
+        except Exception as e:
+            log.warning(
+                "ECMWF ensemble fetch failed (%s %s %s): %s",
+                lat_r, lon_r, valid_date, e,
+            )
+            return None
+
+    if cached is None:
+        return None
+
+    daily = cached.get("daily", {})
+    member_temps: list[float] = []
+    for i in range(51):
+        key = f"temperature_2m_max_member{i:02d}"
+        vals = daily.get(key, [])
+        if vals and vals[0] is not None:
+            member_temps.append(float(vals[0]))
+
+    if len(member_temps) < 3:
+        log.warning(
+            "ECMWF ensemble: only %d members returned for %s %s — falling back",
+            len(member_temps), lat_r, lon_r,
+        )
+        return None
+
+    arr = np.array(member_temps)
+
+    if decision_date is not None:
+        lead_days = max(0, (valid_date - decision_date).days)
+    else:
+        lead_days = 0
+
+    # Real ensemble std, floored at 0.5°C (ensemble collapse ≠ zero uncertainty)
+    tmax_std = max(0.5, float(np.std(arr)))
+
+    return ForecastResult(
+        station_id="",
+        valid_date=valid_date,
+        tmax_mean=float(np.mean(arr)),
+        tmax_std=tmax_std,
+        tmin_mean=None,
+        tmin_std=tmax_std,
+        models_used=["ecmwf_ifs_ensemble"],
+    )
+
+
 async def fetch_historical_forecast_ensemble(
     latitude: float,
     longitude: float,
@@ -473,14 +579,33 @@ async def fetch_historical_forecast_ensemble(
     decision_date: date | None = None,
 ) -> ForecastResult | None:
     """
-    Fetch multiple historical models and build an ensemble forecast.
+    Fetch an ensemble forecast for the historical backtest.
 
-    Falls back to single-model if only one model succeeds.
-    ``decision_date`` is forwarded to each model fetch for correct lead-time
-    uncertainty inflation.
+    Primary: actual ECMWF 51-member ensemble spread via
+    ``fetch_historical_ecmwf_ensemble`` — gives the real forecast uncertainty
+    that was available at the time.
+
+    Fallback: multi-model deterministic spread (GFS / ECMWF / GEM / BOM) if
+    the ECMWF ensemble API returns insufficient member data.
+
+    ``decision_date`` is forwarded for correct lead-time uncertainty inflation.
     """
     import numpy as np
 
+    # Primary: real ECMWF ensemble members
+    result = await fetch_historical_ecmwf_ensemble(
+        latitude, longitude, valid_date,
+        timezone=timezone,
+        decision_date=decision_date,
+    )
+    if result is not None:
+        return result
+
+    # Fallback: inter-model spread across deterministic models
+    log.debug(
+        "ECMWF ensemble unavailable for %s %s — falling back to multi-model spread",
+        latitude, longitude,
+    )
     models = models or OPEN_METEO_MODELS
     tmax_all: list[float] = []
     tmin_all: list[float] = []
