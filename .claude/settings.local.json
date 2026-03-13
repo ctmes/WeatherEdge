@@ -27,7 +27,9 @@
       "Read(//Users/colin/Library/Caches/**)",
       "Bash(python -c \"from weatheredge.pipeline import _process_market; from weatheredge.regime import assess_regime; print\\(''imports OK''\\)\")",
       "Bash(python -:*)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(curl -sI https://r2.pmxt.dev/polymarket_orderbook_2026-03-06T06.parquet)",
+      "Bash(sqlite3 \"/Users/colin/August Labs/WeatherEdge/data/weatheredge.db\" \".schema\")"
     ]
   }
 }

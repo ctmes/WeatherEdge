@@ -180,8 +180,10 @@ def _calculate_paper_pnl(signal: Signal, won: bool, actual_fill: float | None = 
     Calculate paper P&L for a signal, incorporating actual slippage if available.
 
     Paper bet $X at market_prob price:
-      - Win: $X * (1 / fill_price - 1) minus 2% fee
+      - Win: gross_payout * (1 - 0.02) * (1 - 0.02) - bet  (~3.96% total fee drag)
       - Lose: -$X
+
+    Two-sided fee: Polymarket charges ~2% on entry and ~2% on exit/resolution.
     """
     bet = signal.bet_size_usd or 0.0
     if bet <= 0:
@@ -190,13 +192,13 @@ def _calculate_paper_pnl(signal: Signal, won: bool, actual_fill: float | None = 
     if won:
         # Use actual_fill if we have it, else fallback to market_prob (0 slippage)
         fill_price = actual_fill if actual_fill is not None else (signal.market_prob or 0.5)
-        
+
         if fill_price <= 0:
             fill_price = 0.01
-            
-        gross_return = bet * (1.0 / fill_price - 1.0)
-        fee = gross_return * 0.02  # 2% fee on winnings
-        return gross_return - fee
+
+        gross_payout = bet * (1.0 / fill_price)
+        net_payout = gross_payout * (1 - 0.02) * (1 - 0.02)
+        return net_payout - bet
     else:
         return -bet
 

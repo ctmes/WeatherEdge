@@ -11,14 +11,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import signal
 import time
 from datetime import datetime
 
-from weatheredge.db import init_db, get_session, get_calibrations, warn_stale_calibrations
-from weatheredge.logger import log_scan
+from weatheredge.db import init_db, get_session, get_calibrations, warn_stale_calibrations, get_pnl_summary
+from weatheredge.logger import log_scan, log_market_prices
 from weatheredge.pipeline import run_scan
 from weatheredge.calibrate_all import run_all_calibrations
+from weatheredge.safety import CircuitBreaker
 
 logger = logging.getLogger("weatheredge.scheduler")
 
@@ -79,6 +81,7 @@ async def run_loop(
         interval_minutes, f"{bankroll:,.0f}", once,
     )
 
+    circuit_breaker = CircuitBreaker()
     cycle = 0
     _running = True
     start_time = time.monotonic()
@@ -113,6 +116,30 @@ async def run_loop(
         if cycle % resolve_every_n == 0:
             await _run_resolution_check()
 
+        # ── Circuit breaker ───────────────────────────────────────
+        try:
+            async with get_session() as session:
+                pnl = await get_pnl_summary(session, bankroll)
+            cb_status, cb_msg = circuit_breaker.check(
+                bankroll=pnl["current_bankroll"],
+                daily_pnl=pnl["daily_pnl"],
+                weekly_pnl=pnl["weekly_pnl"],
+                monthly_pnl=pnl["monthly_pnl"],
+                peak_bankroll=pnl["peak_bankroll"],
+            )
+            if cb_status == "SHUTDOWN":
+                logger.critical("CIRCUIT BREAKER — SHUTDOWN: %s. Halting scheduler.", cb_msg)
+                _running = False
+            elif cb_status == "REVIEW":
+                logger.critical("CIRCUIT BREAKER — REVIEW: %s. Halting scheduler for manual review.", cb_msg)
+                _running = False
+            elif cb_status == "PAUSE":
+                logger.warning("CIRCUIT BREAKER — PAUSE: %s. Pausing for 24 hours.", cb_msg)
+                await asyncio.sleep(24 * 3600)
+                continue
+        except Exception:
+            logger.exception("Circuit breaker check failed — continuing.")
+
         if once:
             logger.info("Single-cycle mode — exiting.")
             break
@@ -123,9 +150,10 @@ async def run_loop(
                 logger.info("Duration limit of %.2f hours reached — exiting.", duration_hours)
                 break
 
-        # ── Sleep ─────────────────────────────────────────────────
-        sleep_secs = interval_minutes * 60
-        logger.info("Sleeping %s minutes until next scan...", interval_minutes)
+        # ── Sleep (with jitter to avoid predictable execution patterns) ───
+        jitter_secs = random.uniform(-120, 240)  # -2 to +4 minutes
+        sleep_secs = max(60, interval_minutes * 60 + jitter_secs)
+        logger.info("Sleeping %.1f minutes until next scan...", sleep_secs / 60)
         await asyncio.sleep(sleep_secs)
 
 
@@ -148,12 +176,23 @@ async def _run_one_cycle(bankroll: float, calibrations: dict | None = None) -> N
 
     elapsed = time.monotonic() - t0
 
-    # Log to database
+    # Log signals to database
     try:
         written = await log_scan(signals, diag, scan_time)
     except Exception:
         logger.exception("Log FAILED — signals not persisted this cycle.")
         return
+
+    # Log market price snapshots so the resolver can simulate realistic fill prices.
+    # Group by market: {market_id: {bin_index: market_prob}}
+    market_price_map: dict[str, dict[int, float]] = {}
+    for sig in signals:
+        market_price_map.setdefault(sig.market_id, {})[sig.bin_index] = sig.market_prob
+    for mid, prices in market_price_map.items():
+        try:
+            await log_market_prices(mid, prices, scan_time)
+        except Exception:
+            logger.warning("Failed to log market prices for %s — skipping.", mid)
 
     # Health check: warn if scan was slow
     if elapsed > 300:  # 5 minutes

@@ -425,6 +425,79 @@ async def get_next_market_price(
 
 
 # ---------------------------------------------------------------------------
+# P&L and exposure helpers (for circuit breaker and position limits)
+# ---------------------------------------------------------------------------
+
+async def get_pnl_summary(session: AsyncSession, bankroll: float) -> dict[str, float]:
+    """
+    Return P&L sums for circuit breaker checks.
+
+    Queries resolved Results over 24h, 7d, and 30d windows plus an all-time
+    total used to estimate current and peak bankroll.
+    """
+    from sqlalchemy import select, func
+    from weatheredge.models import Result
+    from datetime import timedelta
+
+    now = datetime.utcnow()
+
+    async def _sum(since: datetime) -> float:
+        val = await session.scalar(
+            select(func.sum(Result.pnl_usd)).where(Result.resolved_at >= since)
+        )
+        return float(val) if val is not None else 0.0
+
+    daily = await _sum(now - timedelta(hours=24))
+    weekly = await _sum(now - timedelta(days=7))
+    monthly = await _sum(now - timedelta(days=30))
+
+    all_time = float(
+        await session.scalar(select(func.sum(Result.pnl_usd))) or 0.0
+    )
+    current = bankroll + all_time
+    peak = max(bankroll, current)
+
+    return {
+        "daily_pnl": daily,
+        "weekly_pnl": weekly,
+        "monthly_pnl": monthly,
+        "current_bankroll": current,
+        "peak_bankroll": peak,
+    }
+
+
+async def get_exposure_summary(
+    session: AsyncSession,
+    market_id: str | None = None,
+) -> dict[str, float]:
+    """
+    Return current open bet exposure totals.
+
+    Used by position limit checks to prevent exceeding bankroll limits across
+    concurrent open positions.  ``market_id`` is optional — when provided the
+    per-market exposure is also returned.
+    """
+    from sqlalchemy import select, func
+    from weatheredge.models import Result, Signal
+
+    base = (
+        select(func.sum(Signal.bet_size_usd))
+        .outerjoin(Result, Result.signal_id == Signal.id)
+        .where(Signal.signal_type.in_(["paper", "real"]))
+        .where(Result.id.is_(None))
+    )
+    total = float(await session.scalar(base) or 0.0)
+
+    market = 0.0
+    if market_id:
+        market = float(
+            await session.scalar(base.where(Signal.market_id == market_id)) or 0.0
+        )
+
+    return {"total_exposure": total, "market_exposure": market}
+
+
+# ---------------------------------------------------------------------------
 # Teardown (for tests / clean shutdown)
 # ---------------------------------------------------------------------------
 

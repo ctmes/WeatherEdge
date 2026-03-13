@@ -1,0 +1,53 @@
+# WeatherEdge systemd service unit
+#
+# INSTALL:
+#   1. Edit WorkingDirectory and ExecStart below to match your VPS paths.
+#   2. sudo cp deploy/weatheredge.service /etc/systemd/system/weatheredge.service
+#   3. sudo systemctl daemon-reload
+#   4. sudo systemctl enable weatheredge
+#   5. sudo systemctl start weatheredge
+#
+# MONITOR:
+#   sudo systemctl status weatheredge
+#   journalctl -u weatheredge -f
+#
+# The circuit breakers in safety.py exit the process cleanly (exit code 0).
+# RestartPreventExitCode=0 ensures systemd does NOT auto-restart on a clean
+# circuit-breaker trip — you must review logs and restart manually.
+# All other failures (crashes, exceptions) get restarted after 60 seconds.
+
+[Unit]
+Description=WeatherEdge Paper Trading Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# ── Edit these paths ──────────────────────────────────────────────────────
+User=ubuntu
+WorkingDirectory=/home/ubuntu/WeatherEdge
+ExecStart=/home/ubuntu/WeatherEdge/.venv/bin/weatheredge run --bankroll 10000
+# ─────────────────────────────────────────────────────────────────────────
+
+# Restart on failure (crashes, unhandled exceptions) but not on clean exit.
+# Circuit breakers exit cleanly (code 0) — systemd will NOT auto-restart.
+Restart=on-failure
+RestartSec=60
+RestartPreventExitCode=0
+
+# Limit restart storms: no more than 5 restarts in 10 minutes.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+# Capture stdout/stderr to journald.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=weatheredge
+
+# Environment file for API keys and DATABASE_URL.
+# Create this file on the VPS: /home/ubuntu/WeatherEdge/.env
+EnvironmentFile=-/home/ubuntu/WeatherEdge/.env
+
+[Install]
+WantedBy=multi-user.target

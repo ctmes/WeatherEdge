@@ -17,19 +17,20 @@ import logging
 from datetime import datetime, timedelta
 from typing import Dict, List
 
-from weatheredge.db import init_db, get_session, get_calibrations, warn_stale_calibrations
+from weatheredge.db import init_db, get_session, get_calibrations, warn_stale_calibrations, get_pnl_summary, get_exposure_summary
 from weatheredge.logger import log_scan
 from weatheredge.pipeline import fetch_weather_markets, get_station, fetch_forecast, fetch_regime_data, _process_market, AtmosphericRegime
 from weatheredge.ws_client import WeatherEdgeMarketWS, OrderbookSnapshot, TradeEvent
 from weatheredge.models import ParsedMarket, ForecastResult
 from weatheredge.execution import execute_signal, load_open_positions, clear_executed_signals
 from weatheredge.config import TRADING
+from weatheredge.safety import CircuitBreaker, check_position_limits
 
 logger = logging.getLogger("weatheredge.live_paper")
 
 # Maximum age of per-station forecast data before we refuse to trade that station.
 # A station whose forecast fetch failed silently will have no entry here and be skipped.
-_FORECAST_MAX_AGE_SECS = 7200  # 2 × default 3600s refresh interval
+_FORECAST_MAX_AGE_SECS = 3600  # 1 × default refresh interval (Meteorologist: 2h is too stale)
 
 
 async def run_live_paper(
@@ -50,6 +51,13 @@ async def run_live_paper(
     await load_open_positions()
 
     ws = WeatherEdgeMarketWS()
+    circuit_breaker = CircuitBreaker()
+
+    # Mutable state shared between the main loop and inner callbacks.
+    _state: Dict[str, object] = {
+        "ws_failed": False,
+        "circuit_status": "OK",
+    }
 
     # State
     markets: List[ParsedMarket] = []
@@ -110,6 +118,23 @@ async def run_live_paper(
                 "Calibrations reloaded: %d stations.", len(calibrations)
             )
 
+            # ── Circuit breaker check ─────────────────────────────
+            try:
+                async with get_session() as session:
+                    pnl = await get_pnl_summary(session, bankroll)
+                cb_status, cb_msg = circuit_breaker.check(
+                    bankroll=pnl["current_bankroll"],
+                    daily_pnl=pnl["daily_pnl"],
+                    weekly_pnl=pnl["weekly_pnl"],
+                    monthly_pnl=pnl["monthly_pnl"],
+                    peak_bankroll=pnl["peak_bankroll"],
+                )
+                if cb_status != "OK":
+                    logger.critical("CIRCUIT BREAKER — %s: %s", cb_status, cb_msg)
+                _state["circuit_status"] = cb_status
+            except Exception:
+                logger.exception("Circuit breaker check failed — continuing.")
+
             last_market_refresh = datetime.utcnow()
             logger.info("Metadata refresh complete for %d stations.", len(unique_stations))
 
@@ -151,8 +176,8 @@ async def run_live_paper(
 
     ws.on_trade = on_trade
 
-    # Add a done-callback so unexpected exceptions from ws.run() are surfaced
-    # immediately rather than silently swallowed until shutdown.
+    # Add a done-callback that sets _state["ws_failed"] so the main loop can
+    # exit cleanly rather than continuing with a dead orderbook connection.
     ws_task = asyncio.create_task(ws.run())
 
     def _ws_task_done(task: asyncio.Task) -> None:
@@ -160,12 +185,31 @@ async def run_live_paper(
             return
         exc = task.exception()
         if exc is not None:
-            logger.error("ws.run() raised an unexpected exception: %s", exc, exc_info=exc)
+            logger.critical(
+                "ws.run() crashed — stopping live-paper daemon: %s", exc, exc_info=exc,
+            )
+            _state["ws_failed"] = True
 
     ws_task.add_done_callback(_ws_task_done)
 
     try:
         while True:
+            # ── Safety guards: check before every evaluation cycle ─────────
+            if _state["ws_failed"]:
+                logger.critical(
+                    "WebSocket connection failed — exiting live-paper daemon. "
+                    "Process manager should restart the service."
+                )
+                break
+
+            if _state["circuit_status"] in ("SHUTDOWN", "REVIEW", "PAUSE"):
+                logger.critical(
+                    "Circuit breaker tripped (%s) — exiting live-paper daemon. "
+                    "Review logs and restart manually.",
+                    _state["circuit_status"],
+                )
+                break
+
             now = datetime.utcnow()
 
             # Step 0+1+2: refresh markets, forecasts, and calibrations together.
@@ -215,8 +259,14 @@ async def run_live_paper(
                 }
 
                 # Step 3: run algo — price used here is the live orderbook mid.
+                # Pass current DB exposure so position limits are checked against
+                # real open positions, not the default 0.0 (which always passes).
+                async with get_session() as _exp_session:
+                    _exp = await get_exposure_summary(_exp_session, market_id=m.condition_id)
                 signals, _ = _process_market(
                     m, fc_by_date, rg_by_date, station_cal, bankroll,
+                    current_market_exposure=_exp["market_exposure"],
+                    current_total_exposure=_exp["total_exposure"],
                     orderbooks=valid_orderbooks,
                 )
                 all_signals.extend(signals)
@@ -226,6 +276,24 @@ async def run_live_paper(
                 # Step 4: execute immediately — the price we decided on is the
                 # same price we act on. No re-fetch, no sleep.
                 for signal in all_signals:
+                    # Re-check total exposure before each execution — multiple
+                    # signals can fire in the same cycle and each one changes
+                    # the total deployment.
+                    async with get_session() as _chk_session:
+                        _chk = await get_exposure_summary(_chk_session, market_id=signal.market_id)
+                    allowed, reason = check_position_limits(
+                        signal.recommended_bet_usd,
+                        bankroll,
+                        _chk["market_exposure"],
+                        _chk["total_exposure"],
+                    )
+                    if not allowed:
+                        logger.info(
+                            "Position limit: skipping %s bin %d — %s",
+                            signal.market_id, signal.bin_index, reason,
+                        )
+                        continue
+
                     await execute_signal(
                         signal, bankroll,
                         live=TRADING.live_trading_enabled,
