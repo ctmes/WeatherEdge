@@ -242,6 +242,10 @@ def main() -> None:
         "--force", action="store_true",
         help="Re-run calibration for all stations even if already in DB",
     )
+    cal_all_parser.add_argument(
+        "--from-cache", action="store_true",
+        help="Skip API calls: read existing disk cache files and write them to DB",
+    )
 
     # -- backtest -----------------------------------------------------
     bt_parser = subparsers.add_parser(
@@ -668,11 +672,13 @@ def _run_calibrate(args: argparse.Namespace) -> None:
 
 
 def _run_calibrate_all(args: argparse.Namespace) -> None:
-    from weatheredge.calibrate_all import run_all_calibrations
-    
-    # run_all_calibrations handles DB init and saving internally
-    results = asyncio.run(run_all_calibrations(days=args.days, force=args.force))
-    
+    from weatheredge.calibrate_all import run_all_calibrations, sync_cache_to_db
+
+    if getattr(args, "from_cache", False):
+        results = asyncio.run(sync_cache_to_db())
+    else:
+        results = asyncio.run(run_all_calibrations(days=args.days, force=args.force))
+
     if not results:
         print("\n  ✗ No stations processed.")
         sys.exit(1)

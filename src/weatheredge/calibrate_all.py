@@ -9,14 +9,71 @@ to the database.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import pathlib
 from dataclasses import asdict
 
-from weatheredge.calibration import run_calibration
+from weatheredge.calibration import StationBias, run_calibration
 from weatheredge.db import get_calibrations, get_session, init_db, upsert_calibration
 from weatheredge.stations import STATIONS
 
 logger = logging.getLogger("weatheredge.calibrate_all")
+
+_CACHE_DIR = pathlib.Path.home() / ".weatheredge" / "calibration_cache"
+
+
+async def sync_cache_to_db() -> dict[str, str]:
+    """
+    Read all calibration disk-cache files and upsert the best result per
+    station into the DB.  No API calls are made.
+
+    Returns a dict mapping station_id -> "saved" | "skipped" | "error".
+    """
+    await init_db()
+
+    # Collect best bias per station (most observations wins)
+    best: dict[str, StationBias] = {}
+    for path in _CACHE_DIR.glob("*.json"):
+        try:
+            data = json.loads(path.read_text())
+            bias_dict = data.get("bias")
+            if not bias_dict:
+                continue
+            sid = bias_dict.get("station_id")
+            if not sid or sid not in STATIONS:
+                continue
+            bias = StationBias(**bias_dict)
+            prev = best.get(sid)
+            if prev is None or bias.n_observations > prev.n_observations:
+                best[sid] = bias
+        except Exception as e:
+            logger.debug("Skipping %s: %s", path.name, e)
+
+    if not best:
+        logger.warning("No valid calibration cache files found in %s", _CACHE_DIR)
+        return {}
+
+    results: dict[str, str] = {}
+    for sid, bias in sorted(best.items()):
+        try:
+            async with get_session() as session:
+                await upsert_calibration(session, bias)
+            logger.info(
+                "  ✓ %s — n_obs=%d  tmax_rmse=%.2f  sig_seasons=%d",
+                sid,
+                bias.n_observations,
+                bias.tmax_rmse,
+                sum(1 for p in bias.tmax_p_values.values() if p < 0.1),
+            )
+            results[sid] = "saved"
+        except Exception as e:
+            logger.error("  ✗ %s: %s", sid, e)
+            results[sid] = "error"
+
+    saved = sum(1 for v in results.values() if v == "saved")
+    logger.info("sync_cache_to_db: %d/%d stations written to DB", saved, len(results))
+    return results
 
 async def run_all_calibrations(days: int = 1825, force: bool = False) -> dict[str, dict]:
     """

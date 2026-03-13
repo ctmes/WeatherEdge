@@ -25,7 +25,8 @@
       "Bash(python3:*)",
       "Bash(find ~/.cache/weatheredge -name *.json)",
       "Read(//Users/colin/Library/Caches/**)",
-      "Bash(python -c \"from weatheredge.pipeline import _process_market; from weatheredge.regime import assess_regime; print\\(''imports OK''\\)\")"
+      "Bash(python -c \"from weatheredge.pipeline import _process_market; from weatheredge.regime import assess_regime; print\\(''imports OK''\\)\")",
+      "Bash(python -:*)"
     ]
   }
 }
