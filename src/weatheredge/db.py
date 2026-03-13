@@ -120,6 +120,34 @@ async def init_db() -> None:
                     "ALTER TABLE brier_scores ADD COLUMN baseline_brier FLOAT"
                 ))
 
+            if "rps" not in brier_scores_cols:
+                logger.info("Auto-migrating: adding 'rps' to 'brier_scores'")
+                connection.execute(text(
+                    "ALTER TABLE brier_scores ADD COLUMN rps FLOAT"
+                ))
+
+            if "log_score" not in brier_scores_cols:
+                logger.info("Auto-migrating: adding 'log_score' to 'brier_scores'")
+                connection.execute(text(
+                    "ALTER TABLE brier_scores ADD COLUMN log_score FLOAT"
+                ))
+
+            # backtest_runs table
+            cursor = connection.execute(text("PRAGMA table_info(backtest_runs)"))
+            backtest_runs_cols = [row[1] for row in cursor.fetchall()]
+
+            if "avg_rps" not in backtest_runs_cols:
+                logger.info("Auto-migrating: adding 'avg_rps' to 'backtest_runs'")
+                connection.execute(text(
+                    "ALTER TABLE backtest_runs ADD COLUMN avg_rps FLOAT"
+                ))
+
+            if "avg_log_score" not in backtest_runs_cols:
+                logger.info("Auto-migrating: adding 'avg_log_score' to 'backtest_runs'")
+                connection.execute(text(
+                    "ALTER TABLE backtest_runs ADD COLUMN avg_log_score FLOAT"
+                ))
+
             # station_calibration table
             cursor = connection.execute(text("PRAGMA table_info(station_calibration)"))
             cal_cols = [row[1] for row in cursor.fetchall()]

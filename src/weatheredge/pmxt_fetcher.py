@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import gc
 import hashlib
-import io
 import json
 import logging
 import time
@@ -44,21 +43,41 @@ LOCAL_TICK_DATA_DIR = Path("weather_tick_data")
 # ---------------------------------------------------------------------------
 
 
-def _download_parquet(url: str, *, timeout: int = 120) -> pl.DataFrame:
+def _download_parquet(
+    url: str,
+    *,
+    timeout: int = 120,
+    columns: list[str] | None = None,
+) -> pl.DataFrame:
     """Download a Parquet file via httpx and read it with Polars.
 
-    Polars' native HTTP reader uses the object-store crate which requires
-    a Content-Length header.  The pmxt server doesn't always provide one,
-    so we download the bytes with httpx first.
+    Streams directly to a temp file on disk so the download phase uses only
+    ~1 MB of RAM (one chunk) regardless of file size.  Polars then reads the
+    file using memory-mapped I/O, which avoids loading the entire file into
+    RAM — it only materialises the rows/columns actually needed.
 
-    The raw bytes are freed immediately after Polars parses them to avoid
-    holding both the wire bytes and the DataFrame in memory simultaneously.
+    With ``columns``, Polars pushes the projection down to the parquet reader
+    so unrequested columns are never decoded.  This is the critical path for
+    pmxt files (hundreds of MB) on memory-constrained machines.
+
+    The temp file is deleted when the function returns.
     """
-    resp = httpx.get(url, timeout=timeout, follow_redirects=True)
-    resp.raise_for_status()
-    buf = io.BytesIO(resp.content)
-    del resp  # free wire bytes before parsing
-    return pl.read_parquet(buf)
+    import os
+    import tempfile
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".parquet")
+    try:
+        with os.fdopen(tmp_fd, "wb") as f:
+            with httpx.stream("GET", url, timeout=timeout, follow_redirects=True) as resp:
+                resp.raise_for_status()
+                for chunk in resp.iter_bytes(chunk_size=1 << 20):  # 1 MB chunks
+                    f.write(chunk)
+        return pl.read_parquet(tmp_path, columns=columns)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -422,7 +441,7 @@ def fetch_orderbook_at_timestamp(
         url = f"{PMXT_ARCHIVE_BASE}/polymarket_orderbook_{date_str}T{h:02d}.parquet"
         log.info("Fetching pmxt orderbook: %s (hour=%02d)", date_str, h)
         try:
-            df = _download_parquet(url)
+            df = _download_parquet(url, columns=["market_id", "update_type", "timestamp_received", "data"])
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404 and h >= 12:
                 # A 404 on a mid-day-or-later hour means no archive for this
@@ -504,13 +523,14 @@ def fetch_orderbook_for_markets(
     url = build_date_urls(target_date, target_date)[0][1]
     log.info("Fetching pmxt orderbook for %s ...", target_date)
 
+    _PMXT_COLS = ["market_id", "update_type", "timestamp_received", "data"]
     try:
-        df = _download_parquet(url)
+        df = _download_parquet(url, columns=_PMXT_COLS)
     except Exception as e:
         log.warning("Failed to fetch %s: %s (retrying once...)", url, e)
         time.sleep(2)
         try:
-            df = _download_parquet(url)
+            df = _download_parquet(url, columns=_PMXT_COLS)
         except Exception as e2:
             log.warning("Retry failed for %s: %s — skipping", url, e2)
             return {}

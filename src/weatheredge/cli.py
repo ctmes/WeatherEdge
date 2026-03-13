@@ -964,6 +964,8 @@ def _run_backtest(args: argparse.Namespace) -> None:
         print(f"  Signals:      {bt_run.signals_count}")
         print(f"  Total P&L:    ${bt_run.total_pnl or 0:,.2f}")
         print(f"  Avg Brier:    {bt_run.avg_brier or 0:.4f}")
+        print(f"  Avg RPS:      {bt_run.avg_rps or 0:.4f}  (ordinal-aware; lower = better)")
+        print(f"  Avg LogScore: {bt_run.avg_log_score or 0:.3f} bits  (Kelly-linked; lower = better)")
         print("-" * 60)
         print()
 

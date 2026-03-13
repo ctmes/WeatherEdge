@@ -894,50 +894,60 @@ async def fetch_clob_price_at_time(
     for the token going back to market creation.
 
     Returns the last known midpoint price at or before ``target_dt``, or
-    ``None`` if the API returns no data.  Results are cached on disk keyed by
-    ``(token_id, date)`` so repeated backtest runs don't re-download.
-    """
-    date_str = target_dt.date().isoformat()
-    cache_k = _cache_key("clob_ph", token_id, date_str)
-    history: list[dict] | None = _read_cache(cache_k)
+    ``None`` if the API returns no data.
 
-    if history is None:
+    Cache stores only the resolved price (not the full history) keyed by
+    ``(token_id, timestamp)`` — a tiny float instead of a multi-MB list.
+    """
+    target_ts = int(target_dt.timestamp())
+    # Cache key includes the exact timestamp so different decision times get
+    # independent cache entries. The "clob_price" prefix distinguishes from
+    # legacy "clob_ph" entries that stored the full history list.
+    cache_k = _cache_key("clob_price", token_id, str(target_ts))
+    cached_price = _read_cache(cache_k)
+
+    if cached_price is not None:
+        # Cached as {"price": float} or {"_no_price": true}
+        if cached_price.get("_no_price"):
+            best_price = None
+        else:
+            best_price = cached_price.get("price")
+        if best_price is not None:
+            return best_price
+        # _no_price sentinel — fall through to Telonex
+    else:
         url = f"{POLYMARKET_CLOB_BASE}/prices-history"
         params = {"market": token_id, "interval": "max", "fidelity": 1}
+        best_price = None
         try:
             async with _get_clob_ph_sem():  # cap concurrent in-flight responses
                 async with httpx.AsyncClient(timeout=30) as client:
                     resp = await client.get(url, params=params)
                     resp.raise_for_status()
-                    data = resp.json()
-                    history = data.get("history", [])
-                    _write_cache(cache_k, history)
+                    history = resp.json().get("history", [])
+            # Walk the history once to find the price, then discard it —
+            # never hold the multi-MB list in memory beyond this block.
+            for entry in history:
+                t = entry.get("t", 0)
+                p = entry.get("p")
+                if p is None:
+                    continue
+                if t <= target_ts:
+                    best_price = float(p)
+                else:
+                    break
+            del history
+            # Cache only the resolved price — O(1) bytes, not O(history) bytes.
+            if best_price is not None:
+                _write_cache(cache_k, {"price": best_price})
+            else:
+                _write_cache(cache_k, {"_no_price": True})
         except Exception as e:
             log.warning(
                 "CLOB prices-history fetch failed for token %s...%s: %s",
                 token_id[:8], token_id[-4:], e,
             )
             return None
-
-    if not history:
-        # Fall through to Telonex below
-        best_price = None
-    else:
-        # history is sorted ascending by timestamp — walk forward and keep the
-        # last price at or before target_dt.
-        target_ts = int(target_dt.timestamp())
-        best_price: float | None = None
-        for entry in history:
-            t = entry.get("t", 0)
-            p = entry.get("p")
-            if p is None:
-                continue
-            if t <= target_ts:
-                best_price = float(p)
-            else:
-                break  # past target time — stop
-        # Free the multi-MB history list immediately — no longer needed.
-        del history
 
     if best_price is not None:
         return best_price

@@ -6,6 +6,7 @@ Kelly sizing.  Directly from godpaper Section 7.
 from __future__ import annotations
 
 import logging
+import math
 
 from scipy import stats
 
@@ -226,3 +227,48 @@ def brier_score(
     actual = [0.0] * n
     actual[actual_outcome_index] = 1.0
     return sum((p - a) ** 2 for p, a in zip(predicted_probs, actual))
+
+
+def ranked_probability_score(
+    predicted_probs: list[float],
+    actual_outcome_index: int,
+) -> float:
+    """
+    Ranked Probability Score (RPS) for a single ordered-bin market.
+
+    Unlike the Brier score, RPS is ordinal-aware: near-miss predictions on
+    adjacent bins are penalised less than far misses.  Normalised to [0, 1]
+    by dividing by (K-1) so it is comparable across markets with different
+    numbers of bins.
+
+    Lower is better.  0 = perfect, 1 = worst possible.
+    """
+    k = len(predicted_probs)
+    if k < 2:
+        return 0.0
+    cum_forecast = 0.0
+    score = 0.0
+    for i in range(k - 1):
+        cum_forecast += predicted_probs[i]
+        cum_obs = 1.0 if actual_outcome_index <= i else 0.0
+        score += (cum_forecast - cum_obs) ** 2
+    return score / (k - 1)
+
+
+def log_score(
+    predicted_probs: list[float],
+    actual_outcome_index: int,
+    p_min: float = 0.001,
+) -> float:
+    """
+    Logarithmic (Ignorance) score for a single market resolution.
+
+    Measures information gain; directly tied to Kelly wealth growth.
+    Strictly proper and locally sensitive — confident mispredictions are
+    penalised exponentially more than Brier.
+
+    Lower is better.  0 = perfect (p_correct = 1.0).
+    p_min clips the floor to avoid -inf on extreme model failures.
+    """
+    p = max(predicted_probs[actual_outcome_index], p_min)
+    return -math.log2(p)

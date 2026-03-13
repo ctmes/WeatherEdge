@@ -176,6 +176,8 @@ class BacktestRun(Base):
     signals_count = Column(Integer, default=0)
     total_pnl = Column(Float, nullable=True)
     avg_brier = Column(Float, nullable=True)
+    avg_rps = Column(Float, nullable=True)
+    avg_log_score = Column(Float, nullable=True)
     max_drawdown = Column(Float, nullable=True)
     sharpe_ratio = Column(Float, nullable=True)
 
@@ -195,6 +197,8 @@ class BrierScore(Base):
     model = Column(String)
     brier_score = Column(Float)
     baseline_brier = Column(Float, nullable=True)    # For BSS calculation
+    rps = Column(Float, nullable=True)               # Ranked Probability Score (ordinal-aware)
+    log_score = Column(Float, nullable=True)         # Ignorance score (Kelly-linked)
     calculated_at = Column(DateTime, server_default=func.now())
 
     backtest_run = relationship("BacktestRun", back_populates="brier_scores")

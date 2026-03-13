@@ -77,7 +77,7 @@ from weatheredge.models import (
 
 from weatheredge.pipeline import _process_market
 
-from weatheredge.probability import brier_score, normalise_market_probs
+from weatheredge.probability import brier_score, log_score, normalise_market_probs, ranked_probability_score
 
 from weatheredge.stations import get_station
 
@@ -433,6 +433,9 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
                     market_id=bs_record["market_id"],
                     model=bs_record["model"],
                     brier_score=bs_record["brier"],
+                    baseline_brier=bs_record.get("baseline_brier"),
+                    rps=bs_record.get("rps"),
+                    log_score=bs_record.get("log_score"),
                 ))
         total_signals += len(all_signals)
         all_signals.clear()
@@ -618,12 +621,14 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
             # Live Ticker Header
             q_safe = parsed.question.encode("ascii", "ignore").decode("ascii")
 
-            # Brier score (always compute when possible, even if no signals)
+            # Brier score: in brier_only mode score all markets (calibration);
+            # in a normal backtest only score markets where we generated signals
+            # so the metric reflects actual decision quality at entry.
             from weatheredge.probability import forecast_to_probabilities
             from weatheredge.polymarket import parse_bins_from_outcomes
 
             bins = parse_bins_from_outcomes(parsed.outcomes) if not parsed.bins else parsed.bins
-            if bins and forecast:
+            if bins and forecast and (brier_only or signals):
                 # -- Probability Calculation (with Calibration) ---
                 from weatheredge.calibration import apply_calibration, apply_calibration_std
 
@@ -643,6 +648,8 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
 
                 model_probs = forecast_to_probabilities(cal_mean, cal_std, bins)
                 bs = brier_score(model_probs, resolved_bin)
+                rps = ranked_probability_score(model_probs, resolved_bin)
+                ls = log_score(model_probs, resolved_bin)
 
                 num_bins = len(bins)
                 baseline_probs = [1.0 / num_bins] * num_bins
@@ -654,6 +661,8 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
                     "model": model if not use_ensemble else "ensemble",
                     "brier": bs,
                     "baseline_brier": bbs,
+                    "rps": rps,
+                    "log_score": ls,
                 })
 
             if signals:
@@ -743,27 +752,33 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
     # -- 6. Summary Stats & Persist -----------------------------------
     total_pnl = total_pnl_running
     
-    # Calculate baseline Brier for BSS.
-    # NOTE: brier_scores was flushed to DB in batches above so the in-memory
-    # list is now empty.  Re-derive avg_baseline using 1/n uniform assumption
-    # which doesn't require re-reading the whole dataset.  avg_brier is queried
-    # from the DB below.
-    avg_baseline_brier = 1.0  # uniform = 1/n; refined from DB query below
+    # Fetch avg scores from DB (brier_scores list was flushed in batches above).
+    avg_baseline_brier = 1.0  # fallback: uniform 1/n overestimates the baseline
     avg_brier: float | None = None
+    avg_rps: float | None = None
+    avg_log_score: float | None = None
     try:
         from sqlalchemy import select, func
         async with get_session() as session:
-            # Fetch avg brier from DB for this run (already written in batches)
             row = await session.execute(
-                select(func.avg(BrierScore.brier_score)).where(
-                    BrierScore.backtest_run_id == run_id
-                )
+                select(
+                    func.avg(BrierScore.brier_score),
+                    func.avg(BrierScore.baseline_brier),
+                    func.avg(BrierScore.rps),
+                    func.avg(BrierScore.log_score),
+                ).where(BrierScore.backtest_run_id == run_id)
             )
-            avg_brier_val = row.scalar()
+            avg_brier_val, avg_baseline_val, avg_rps_val, avg_ls_val = row.one()
             if avg_brier_val is not None:
                 avg_brier = float(avg_brier_val)
+            if avg_baseline_val is not None:
+                avg_baseline_brier = float(avg_baseline_val)
+            if avg_rps_val is not None:
+                avg_rps = float(avg_rps_val)
+            if avg_ls_val is not None:
+                avg_log_score = float(avg_ls_val)
     except Exception as e:
-        log.warning("Could not compute avg brier from DB: %s", e)
+        log.warning("Could not compute avg scores from DB: %s", e)
     
     bss = analytics.brier_skill_score(avg_brier, avg_baseline_brier) if avg_brier is not None else 0.0
     mdd = analytics.max_drawdown(equity_curve)
@@ -794,6 +809,8 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
     bt_run.signals_count = total_signals
     bt_run.total_pnl = total_pnl
     bt_run.avg_brier = avg_brier
+    bt_run.avg_rps = avg_rps
+    bt_run.avg_log_score = avg_log_score
     bt_run.max_drawdown = float(mdd)
     bt_run.sharpe_ratio = float(sharpe)
 
@@ -809,6 +826,8 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
                 signals_count=total_signals,
                 total_pnl=bt_run.total_pnl,
                 avg_brier=bt_run.avg_brier,
+                avg_rps=bt_run.avg_rps,
+                avg_log_score=bt_run.avg_log_score,
                 max_drawdown=bt_run.max_drawdown,
                 sharpe_ratio=bt_run.sharpe_ratio,
             )

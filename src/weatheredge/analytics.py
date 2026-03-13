@@ -46,6 +46,31 @@ def calculate_climatological_baseline(bins: list[tuple[float, float]], hist_mean
     return float(np.sum(np.square(probs)))
 
 
+def expected_calibration_error(
+    predicted_probs: list[float],
+    outcomes: list[int],
+    n_bins: int = 10,
+) -> float:
+    """
+    Expected Calibration Error (ECE): sample-weighted mean absolute gap
+    between predicted confidence and actual hit rate, across n_bins buckets.
+
+    predicted_probs: probability assigned to the 'true' outcome for each market
+    outcomes: 1 (correct) or 0 (incorrect) for each prediction
+    Returns ECE in [0, 1]; 0 = perfect calibration.
+    """
+    diagram = reliability_diagram_data(predicted_probs, outcomes, n_bins=n_bins)
+    if not diagram:
+        return 0.0
+    total = sum(d["count"] for d in diagram)
+    if total == 0:
+        return 0.0
+    return float(sum(
+        (d["count"] / total) * abs(d["predicted_mean"] - d["actual_frequency"])
+        for d in diagram
+    ))
+
+
 def reliability_diagram_data(
     predicted_probs: list[float], 
     outcomes: list[int], 
