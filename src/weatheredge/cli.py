@@ -238,6 +238,10 @@ def main() -> None:
         "--days", type=int, default=1825,
         help="Number of days of history to use (default: 1825 = 5 years)",
     )
+    cal_all_parser.add_argument(
+        "--force", action="store_true",
+        help="Re-run calibration for all stations even if already in DB",
+    )
 
     # -- backtest -----------------------------------------------------
     bt_parser = subparsers.add_parser(
@@ -667,7 +671,7 @@ def _run_calibrate_all(args: argparse.Namespace) -> None:
     from weatheredge.calibrate_all import run_all_calibrations
     
     # run_all_calibrations handles DB init and saving internally
-    results = asyncio.run(run_all_calibrations(days=args.days))
+    results = asyncio.run(run_all_calibrations(days=args.days, force=args.force))
     
     if not results:
         print("\n  ✗ No stations processed.")

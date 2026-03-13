@@ -82,19 +82,23 @@ def assess_regime(
     result = RegimeAssessment(station_id=regime.station_id)
 
     # ── Model divergence ──────────────────────────────────────────
+    # Use explicit temps if provided, otherwise use pre-computed regime.model_divergence
+    # (set by the pipeline from ForecastResult.model_divergence before this call).
     if gfs_tmax is not None and ecmwf_tmax is not None:
         divergence = abs(gfs_tmax - ecmwf_tmax)
         regime.model_divergence = divergence
+    else:
+        divergence = regime.model_divergence  # already populated by pipeline
 
-        if divergence > TRADING.model_divergence_no_bet:
-            result.flags.append("MODEL_DIVERGENCE_HIGH")
-            result.confidence_multiplier = 0.0
-            result.can_trade = False
-            result.reason = (
-                f"GFS/ECMWF divergence {divergence:.1f}°C "
-                f"exceeds {TRADING.model_divergence_no_bet}°C threshold"
-            )
-            return result  # hard stop
+    if divergence > TRADING.model_divergence_no_bet:
+        result.flags.append("MODEL_DIVERGENCE_HIGH")
+        result.confidence_multiplier = 0.0
+        result.can_trade = False
+        result.reason = (
+            f"GFS/ECMWF divergence {divergence:.1f}°C "
+            f"exceeds {TRADING.model_divergence_no_bet}°C threshold"
+        )
+        return result  # hard stop
 
     # ── Ensemble spread ───────────────────────────────────────────
     spread = ensemble_spread or regime.ensemble_spread

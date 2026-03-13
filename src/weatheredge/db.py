@@ -120,6 +120,22 @@ async def init_db() -> None:
                     "ALTER TABLE brier_scores ADD COLUMN baseline_brier FLOAT"
                 ))
 
+            # station_calibration table
+            cursor = connection.execute(text("PRAGMA table_info(station_calibration)"))
+            cal_cols = [row[1] for row in cursor.fetchall()]
+
+            for col, typedef in [
+                ("tmax_rmse",     "FLOAT DEFAULT 0"),
+                ("tmin_rmse",     "FLOAT DEFAULT 0"),
+                ("tmax_p_values", "JSON"),
+                ("tmin_p_values", "JSON"),
+            ]:
+                if col not in cal_cols:
+                    logger.info("Auto-migrating: adding '%s' to 'station_calibration'", col)
+                    connection.execute(text(
+                        f"ALTER TABLE station_calibration ADD COLUMN {col} {typedef}"
+                    ))
+
         await conn.run_sync(_migrate_sync)
 
     logger.info("Database tables initialised and migrated.")
@@ -236,6 +252,10 @@ async def upsert_calibration(session: AsyncSession, bias: Any) -> None:
         "tmin_bias_winter": bias.tmin_bias_winter,
         "tmin_bias_spring": bias.tmin_bias_spring,
         "tmin_bias_autumn": bias.tmin_bias_autumn,
+        "tmax_rmse": bias.tmax_rmse,
+        "tmin_rmse": bias.tmin_rmse,
+        "tmax_p_values": bias.tmax_p_values,
+        "tmin_p_values": bias.tmin_p_values,
         "lead_time_degradation": bias.lead_time_degradation,
         "last_updated": datetime.utcnow(),
     }
@@ -270,11 +290,79 @@ async def get_calibrations(session: AsyncSession) -> dict[str, Any]:
             tmin_bias_winter=r.tmin_bias_winter or 0.0,
             tmin_bias_spring=r.tmin_bias_spring or 0.0,
             tmin_bias_autumn=r.tmin_bias_autumn or 0.0,
+            tmax_rmse=r.tmax_rmse or 0.0,
+            tmin_rmse=r.tmin_rmse or 0.0,
+            tmax_p_values=r.tmax_p_values or {},
+            tmin_p_values=r.tmin_p_values or {},
             lead_time_degradation=r.lead_time_degradation or 0.15,
         )
         calibrations[r.station_id] = bias
 
     return calibrations
+
+
+async def get_calibration_ages(session: AsyncSession) -> dict[str, datetime]:
+    """
+    Return the last_updated timestamp for each calibrated station.
+
+    Used by freshness checks in the scheduler and live-paper daemon to warn
+    when bias corrections are stale (i.e. not updated recently enough).
+    """
+    from sqlalchemy import select
+    from weatheredge.models import StationCalibration
+
+    result = await session.execute(
+        select(StationCalibration.station_id, StationCalibration.last_updated)
+    )
+    return {row.station_id: row.last_updated for row in result}
+
+
+async def warn_stale_calibrations(
+    session: AsyncSession,
+    *,
+    max_age_days: int = 14,
+    context: str = "",
+) -> None:
+    """
+    Log a WARNING for every station whose calibration is older than max_age_days.
+
+    Call this after loading calibrations anywhere the algo is about to trade.
+    Does NOT raise — a stale calibration is better than no calibration.
+    """
+    ages = await get_calibration_ages(session)
+    if not ages:
+        logger.warning("%sNo calibrations found in DB.", f"[{context}] " if context else "")
+        return
+
+    now = datetime.utcnow()
+    stale = {
+        sid: lu for sid, lu in ages.items()
+        if lu is None or (now - lu).days >= max_age_days
+    }
+    fresh = len(ages) - len(stale)
+
+    if stale:
+        worst = min(
+            (lu for lu in stale.values() if lu is not None),
+            default=None,
+        )
+        age_str = f"{(now - worst).days}d" if worst else "unknown"
+        logger.warning(
+            "%s%d/%d station calibrations are >%dd old (oldest: %s). "
+            "Run `weatheredge calibrate` to refresh.",
+            f"[{context}] " if context else "",
+            len(stale),
+            len(ages),
+            max_age_days,
+            age_str,
+        )
+    else:
+        logger.debug(
+            "%sAll %d station calibrations are fresh (within %dd).",
+            f"[{context}] " if context else "",
+            fresh,
+            max_age_days,
+        )
 
 
 # ---------------------------------------------------------------------------

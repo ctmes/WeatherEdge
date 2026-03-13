@@ -15,7 +15,7 @@ import signal
 import time
 from datetime import datetime
 
-from weatheredge.db import init_db, get_session, get_calibrations
+from weatheredge.db import init_db, get_session, get_calibrations, warn_stale_calibrations
 from weatheredge.logger import log_scan
 from weatheredge.pipeline import run_scan
 from weatheredge.calibrate_all import run_all_calibrations
@@ -95,6 +95,16 @@ async def run_loop(
     while _running:
         cycle += 1
         logger.info("━━━ Cycle %d ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", cycle)
+
+        # Reload calibrations from DB every cycle — cheap query that ensures
+        # any bias corrections written by run_all_calibrations (or external
+        # tools) are always current before the scan runs.
+        try:
+            async with get_session() as session:
+                calibrations = await get_calibrations(session)
+                await warn_stale_calibrations(session, max_age_days=14, context="scheduler")
+        except Exception:
+            logger.warning("Failed to reload calibrations — using previous values.")
 
         # ── Scan + Log ────────────────────────────────────────────
         await _run_one_cycle(bankroll, calibrations)

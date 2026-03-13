@@ -22,7 +22,10 @@
       "Read(//Users/colin/.weatheredge/mesonet_cache/**)",
       "Read(//Users/colin/.weatheredge/backtest_cache/**)",
       "Bash(python3 -c \":*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(find ~/.cache/weatheredge -name *.json)",
+      "Read(//Users/colin/Library/Caches/**)",
+      "Bash(python -c \"from weatheredge.pipeline import _process_market; from weatheredge.regime import assess_regime; print\\(''imports OK''\\)\")"
     ]
   }
 }

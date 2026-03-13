@@ -335,12 +335,31 @@ def _process_market(
         return [], detail
 
     # ── Regime check ──────────────────────────────────────────────────
-    regime_assessment = RegimeAssessment(station_id=market.station_id or "")
+    # Always build a regime object carrying the forecast-derived values.
+    # CAPE/wind data from rg_by_date is supplementary; model_divergence and
+    # ensemble_spread from ForecastResult are always available and must always
+    # be checked — including in backtests where rg_by_date is empty.
     if target_date and target_date in rg_by_date:
         regime = rg_by_date[target_date]
-        regime_assessment = assess_regime(regime)
-        detail["regime_flags"] = regime_assessment.flags
-        detail["confidence_multiplier"] = regime_assessment.confidence_multiplier
+    else:
+        from weatheredge.forecast import AtmosphericRegime
+        regime = AtmosphericRegime(
+            station_id=market.station_id or "",
+            valid_date=target_date or forecast.valid_date,
+        )
+
+    # Populate regime with model-derived circuit-breaker values.
+    regime.model_divergence = forecast.model_divergence
+    regime.ensemble_spread = forecast.tmax_std or 0.0
+
+    regime_assessment = assess_regime(
+        regime,
+        ensemble_spread=forecast.tmax_std,
+    )
+    detail["regime_flags"] = regime_assessment.flags
+    detail["confidence_multiplier"] = regime_assessment.confidence_multiplier
+    if forecast.model_divergence > 0:
+        detail["model_divergence"] = round(forecast.model_divergence, 2)
 
     if not regime_assessment.can_trade:
         detail["regime_blocked"] = True

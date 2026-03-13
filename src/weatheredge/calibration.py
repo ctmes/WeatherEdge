@@ -239,8 +239,12 @@ def apply_calibration(
 
     bias = bias_map.get(season, 0.0)
 
-    # Lead-time degradation — uncertainty increases with lead time
-    # but we apply bias correction regardless
+    # Only apply bias if statistically significant (p < 0.1)
+    p_values = station_bias.tmax_p_values if metric == "tmax" else station_bias.tmin_p_values
+    p_val = p_values.get(season, 1.0)
+    if p_val > 0.1:
+        bias = 0.0
+
     calibrated = forecast_mean + bias
 
     return calibrated
@@ -257,9 +261,13 @@ def apply_calibration_std(
     Uses the larger of model ensemble spread or historical RMSE,
     increased by lead-time degradation.
     """
-    # Use historical RMSE as floor for uncertainty
-    floor_std = station_bias.tmax_rmse if station_bias.tmax_rmse > 0 else 2.0
-    adjusted = max(forecast_std, floor_std)
+    # Use historical RMSE as floor for uncertainty.
+    # If RMSE is 0 (not stored in DB), skip the floor entirely rather than
+    # applying a hardcoded 2.0°C fallback that inflates all distributions.
+    if station_bias.tmax_rmse > 0:
+        adjusted = max(forecast_std, station_bias.tmax_rmse)
+    else:
+        adjusted = forecast_std
 
     # Lead-time degradation
     if lead_time_days > 1:
@@ -306,7 +314,7 @@ def pair_observations_with_forecasts(
 
 async def run_calibration(
     station_id: str,
-    days: int = 1825,
+    days: int = 365,
     end_date: date | None = None,
 ) -> tuple[StationBias, dict[str, Any]]:
     """

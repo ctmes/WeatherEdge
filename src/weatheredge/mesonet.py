@@ -98,6 +98,7 @@ async def fetch_daily_observations(
     coverage = len(iem_obs) / expected_days if expected_days > 0 else 0.0
 
     if coverage >= _MIN_IEM_COVERAGE:
+        _check_obs_tail(station_id, iem_obs, end_date, source="IEM")
         return iem_obs
 
     # IEM returned thin data — fall back to ERA5 reanalysis if coords supplied
@@ -110,8 +111,10 @@ async def fetch_daily_observations(
             station_id, latitude, longitude, start_date, end_date
         )
         if era5_obs:
+            _check_obs_tail(station_id, era5_obs, end_date, source="ERA5")
             return era5_obs
 
+    _check_obs_tail(station_id, iem_obs, end_date, source="IEM")
     return iem_obs
 
 
@@ -218,6 +221,46 @@ async def fetch_hourly_observations(
             continue
 
     return observations
+
+
+# =========================================================================
+# Cache freshness helpers
+# =========================================================================
+
+def _check_obs_tail(
+    station_id: str,
+    obs: list[DailyObservation],
+    requested_end: date,
+    *,
+    source: str = "",
+    max_gap_days: int = 3,
+) -> None:
+    """
+    Warn if the most recent observation is more than max_gap_days before
+    requested_end. Observation data that ends a week before the calibration
+    window's end date means recent bias corrections are based on stale data.
+    """
+    if not obs:
+        log.warning(
+            "%s[%s] No observations returned for requested range ending %s.",
+            f"[{source}] " if source else "",
+            station_id,
+            requested_end,
+        )
+        return
+
+    last_obs_date = max(o.date for o in obs)
+    gap = (requested_end - last_obs_date).days
+    if gap > max_gap_days:
+        log.warning(
+            "%s[%s] Observation data ends %s but calibration requested through %s "
+            "(%d-day gap). Recent bias corrections may be stale.",
+            f"[{source}] " if source else "",
+            station_id,
+            last_obs_date,
+            requested_end,
+            gap,
+        )
 
 
 # =========================================================================

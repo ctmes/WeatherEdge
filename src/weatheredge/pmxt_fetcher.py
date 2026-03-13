@@ -13,6 +13,7 @@ Usage (standalone probe):
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import io
 import json
@@ -49,10 +50,15 @@ def _download_parquet(url: str, *, timeout: int = 120) -> pl.DataFrame:
     Polars' native HTTP reader uses the object-store crate which requires
     a Content-Length header.  The pmxt server doesn't always provide one,
     so we download the bytes with httpx first.
+
+    The raw bytes are freed immediately after Polars parses them to avoid
+    holding both the wire bytes and the DataFrame in memory simultaneously.
     """
     resp = httpx.get(url, timeout=timeout, follow_redirects=True)
     resp.raise_for_status()
-    return pl.read_parquet(io.BytesIO(resp.content))
+    buf = io.BytesIO(resp.content)
+    del resp  # free wire bytes before parsing
+    return pl.read_parquet(buf)
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +414,7 @@ def fetch_orderbook_at_timestamp(
         # (in case PMXT does have data for that specific hour on some days)
         hours_to_try = [hour] + hours_to_try
 
-    result: dict[str, dict] = {}
+    pmxt_result: dict[str, dict] = {}
     got_404_on_reliable_hour = False
     for h in hours_to_try:
         if got_404_on_reliable_hour:
@@ -434,21 +440,30 @@ def fetch_orderbook_at_timestamp(
             continue
 
         if df.is_empty():
+            del df
             continue
 
         ob = _extract_snapshots_from_df(df, id_map, target_ts)
+        # Free the large parquet frame immediately — these files are hundreds of
+        # MB of all-Polymarket orderbook data; holding even one in RAM while
+        # looping over dates causes OOM on the VPS.
+        del df
+        gc.collect()
+
         if ob:
-            result.update(ob)
+            pmxt_result.update(ob)
             log.info(
                 "Found %d/%d additional orderbooks in hour=%02d file for %s",
                 len(ob), len(remaining_ids), h, date_str,
             )
             break
         else:
-            log.debug("Hour=%02d had no matching snapshots, trying previous hour", h)
+            log.debug("Hour=%02d had no matching snapshots, trying next hour", h)
 
-    # Cache the result (including empty — to avoid re-downloading on repeated runs)
-    cache_rows = [{"market_id": mid, "data": json.dumps(d)} for mid, d in result.items()]
+    result.update(pmxt_result)
+
+    # Cache the pmxt portion only (local tick data is sourced separately each time)
+    cache_rows = [{"market_id": mid, "data": json.dumps(d)} for mid, d in pmxt_result.items()]
     cache_df = pl.DataFrame(
         cache_rows if cache_rows else {"market_id": pl.Series([], dtype=pl.Utf8),
                                        "data":      pl.Series([], dtype=pl.Utf8)}

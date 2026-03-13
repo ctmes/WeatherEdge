@@ -110,6 +110,10 @@ class StationCalibration(Base):
     tmin_bias_winter = Column(Float, default=0)
     tmin_bias_spring = Column(Float, default=0)
     tmin_bias_autumn = Column(Float, default=0)
+    tmax_rmse = Column(Float, default=0)
+    tmin_rmse = Column(Float, default=0)
+    tmax_p_values = Column(JSON)
+    tmin_p_values = Column(JSON)
     lead_time_degradation = Column(Float, default=0.15)
     last_updated = Column(DateTime)
 
@@ -233,6 +237,10 @@ class ForecastResult:
     tmin_std: float | None = None
     precip_mean: float | None = None
     models_used: list[str] = field(default_factory=list)
+    # Absolute difference between ECMWF and GFS tmax means (°C).
+    # 0.0 when only one model is available or when using the ensemble endpoint.
+    # Used by regime.assess_regime to fire the MODEL_DIVERGENCE_HIGH guard.
+    model_divergence: float = 0.0
 
 
 @dataclass

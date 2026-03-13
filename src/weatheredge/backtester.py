@@ -33,6 +33,8 @@ from weatheredge.backtest_fetchers import (
 
     cache_fingerprint,
 
+    check_cache_coverage,
+
     extract_resolved_outcome,
 
     extract_winner_from_event,
@@ -49,7 +51,7 @@ from weatheredge.backtest_fetchers import (
 
 from weatheredge.config import TRADING
 
-from weatheredge.db import get_session, init_db, upsert_market
+from weatheredge.db import get_session, init_db, upsert_market, warn_stale_calibrations
 
 from weatheredge.forecast import AtmosphericRegime
 
@@ -193,7 +195,15 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
 
     await init_db()
 
+    # -- 0. Pre-flight data freshness checks --------------------------
+    # Check that the disk cache covers the full requested date range.
+    # Missing tail days trigger a WARNING and will be fetched on demand.
+    check_cache_coverage(start, end)
 
+    # Check that DB calibrations (used when walk_forward=False) are fresh.
+    # Stale calibrations are used with a warning rather than blocking the run.
+    async with get_session() as session:
+        await warn_stale_calibrations(session, max_age_days=14, context="backtest")
 
     # -- 1. Create BacktestRun ----------------------------------------
 
@@ -471,11 +481,16 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
 
 
 
-            # Determine decision time: end_date - 24h
+            # Determine decision time.
+            # CLOB prices are captured at 18:00 UTC on the day BEFORE
+            # resolution (see fetch_clob_resolved_markets). The decision is
+            # made at that moment, so decision_date is resolution_date - 1.
+            # This ensures lead_days=1 for forecast uncertainty and correct
+            # DB timestamps — no look-ahead from same-day observations.
 
             if parsed.resolution_date:
 
-                decision_date = parsed.resolution_date
+                decision_date = parsed.resolution_date - timedelta(days=1)
 
             elif parsed.end_date:
 
@@ -526,8 +541,11 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
 
 
             # -- 4. Run edge calculation (same logic as live) -------------
+            # Key fc_by_date by the resolution date (= target_date), because
+            # _process_market looks up fc_by_date[market.resolution_date].
+            # decision_date is the day BEFORE target_date (see above).
 
-            fc_by_date = {decision_date: forecast}
+            fc_by_date = {target_date: forecast}
 
             rg_by_date: dict[date, AtmosphericRegime] = {}
 
@@ -614,7 +632,11 @@ async def run_backtest(cfg: BacktestConfig) -> BacktestRun:
 
                 if station_cal:
                     cal_mean = apply_calibration(raw_mean, station_cal, target_date, metric=parsed.metric)
-                    cal_std = apply_calibration_std(raw_std, station_cal)
+                    # In ensemble mode the std comes from actual 51-member spread —
+                    # the right uncertainty estimate already. Don't floor it with
+                    # the deterministic-model RMSE; that inflates the distribution
+                    # and raises the Brier score even when the mean is correct.
+                    cal_std = raw_std if use_ensemble else apply_calibration_std(raw_std, station_cal)
                 else:
                     cal_mean = raw_mean
                     cal_std = raw_std

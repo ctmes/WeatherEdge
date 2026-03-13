@@ -18,7 +18,7 @@ from weatheredge.stations import STATIONS
 
 logger = logging.getLogger("weatheredge.calibrate_all")
 
-async def run_all_calibrations(days: int = 1825) -> dict[str, dict]:
+async def run_all_calibrations(days: int = 1825, force: bool = False) -> dict[str, dict]:
     """
     Run calibration for all registered stations and persist to DB.
     
@@ -34,8 +34,10 @@ async def run_all_calibrations(days: int = 1825) -> dict[str, dict]:
         existing = await get_calibrations(session)
 
     skip_count = sum(1 for sid in existing if sid in STATIONS and sid != "GLOBAL")
-    if skip_count:
+    if skip_count and not force:
         logger.info("Skipping %d already-calibrated stations (pass --force to redo)", skip_count)
+    elif skip_count and force:
+        logger.info("--force: re-running all %d existing calibrations", skip_count)
 
     logger.info("Starting bulk calibration for %d stations (lookback: %d days)", total, days)
 
@@ -49,7 +51,7 @@ async def run_all_calibrations(days: int = 1825) -> dict[str, dict]:
             # Skip the dummy global station
             continue
             
-        if station_id in existing:
+        if station_id in existing and not force:
             logger.info("[%d/%d] Skipping %s — already calibrated.", i, total, station_id)
             results[station_id] = {"status": "skipped"}
             continue

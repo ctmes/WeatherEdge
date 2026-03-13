@@ -19,6 +19,8 @@ from weatheredge.config import FORECAST_DAYS, OPEN_METEO_BASE, OPEN_METEO_MODELS
 from weatheredge.models import ForecastResult
 
 _SUBDIR = "forecast_cache"
+_ECMWF_KEY = "ecmwf_ifs"
+_GFS_KEY = "gfs_seamless"
 
 OPEN_METEO_ENSEMBLE = "https://ensemble-api.open-meteo.com/v1/ensemble"
 
@@ -456,6 +458,16 @@ def _build_multimodel_ensemble(
         tmax_arr = np.array(tmax_values)
         tmin_arr = np.array(tmin_values) if tmin_values else None
 
+        # Compute GFS/ECMWF divergence when both are present in the raw data.
+        model_divergence = 0.0
+        if _ECMWF_KEY in raw and _GFS_KEY in raw:
+            ecmwf_tmax_list = raw[_ECMWF_KEY].get("tmax", [])
+            gfs_tmax_list = raw[_GFS_KEY].get("tmax", [])
+            if i < len(ecmwf_tmax_list) and i < len(gfs_tmax_list):
+                ev, gv = ecmwf_tmax_list[i], gfs_tmax_list[i]
+                if not (np.isnan(ev) or np.isnan(gv)):
+                    model_divergence = abs(ev - gv)
+
         results.append(
             ForecastResult(
                 station_id="",
@@ -465,6 +477,7 @@ def _build_multimodel_ensemble(
                 tmin_mean=float(np.mean(tmin_arr)) if tmin_arr is not None and len(tmin_arr) > 0 else None,
                 tmin_std=float(np.std(tmin_arr)) if tmin_arr is not None and len(tmin_arr) > 1 else DEFAULT_STD,
                 models_used=used_models,
+                model_divergence=model_divergence,
             )
         )
 

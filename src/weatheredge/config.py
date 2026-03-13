@@ -185,7 +185,7 @@ class TradingConfig:
 
     max_single_market_exposure: float = 0.10   # 10% bankroll per market cluster
     max_total_exposure: float = 0.60           # 60% bankroll deployed at once
-    min_edge_threshold: float = 0.05            # 5% minimum edge before betting
+    min_edge_threshold: float = 0.03            # 3% minimum edge before betting
     min_liquidity: float = 5_000                # $5,000 minimum market volume
     polymarket_fee: float = 0.02                # 2% fee on winning trades
     assumed_slippage: float = 0.03              # 3% penalty when crossing bid/ask spread

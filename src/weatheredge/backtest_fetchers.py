@@ -37,6 +37,8 @@ from weatheredge.polymarket import _is_weather_market, _raw_to_parsed_market, pa
 log = logging.getLogger("weatheredge.backtest_fetchers")
 
 _SUBDIR = "backtest_cache"
+_ECMWF_KEY = "ecmwf_ifs"
+_GFS_KEY = "gfs_seamless"
 
 # ---------------------------------------------------------------------------
 # Open-Meteo rate-limit semaphore
@@ -89,6 +91,86 @@ def _write_cache(key: str, data: Any) -> None:
 def cache_fingerprint() -> str:
     """Hash of all cached files — identifies the exact data snapshot."""
     return _cache_fp(_SUBDIR)
+
+
+def check_cache_coverage(start: date, end: date) -> dict:
+    """
+    Pre-flight check: scan the disk cache and report which dates in [start, end]
+    already have Gamma event, Gamma market, and historical-forecast data.
+
+    Returns a dict with coverage stats and the last cached date for each type.
+    Logs a WARNING for any gap at the trailing edge (i.e. the most recent
+    requested day is not cached), because that is the "stale cache" scenario
+    the user cares about most.
+
+    Missing interior dates are normal on a fresh run and will be auto-filled
+    during the backtest loop — no need to block on them.
+    """
+    days = [(start + timedelta(days=i)) for i in range((end - start).days + 1)]
+    total = len(days)
+
+    gamma_evt_cached: list[date] = []
+    gamma_mkt_cached: list[date] = []
+
+    for d in days:
+        ds = d.isoformat()
+        if _read_cache(_cache_key("gamma_daily_e", ds)) is not None:
+            gamma_evt_cached.append(d)
+        if _read_cache(_cache_key("gamma_res_m", ds)) is not None:
+            gamma_mkt_cached.append(d)
+
+    last_gamma_evt = gamma_evt_cached[-1] if gamma_evt_cached else None
+    last_gamma_mkt = gamma_mkt_cached[-1] if gamma_mkt_cached else None
+
+    def _trailing_gap(last_cached: date | None) -> int:
+        """Days between last_cached and end. 0 = fully covered."""
+        if last_cached is None:
+            return total
+        return (end - last_cached).days
+
+    gamma_evt_gap = _trailing_gap(last_gamma_evt)
+    gamma_mkt_gap = _trailing_gap(last_gamma_mkt)
+
+    report = {
+        "range": f"{start} → {end}",
+        "total_days": total,
+        "gamma_events": {
+            "cached_days": len(gamma_evt_cached),
+            "last_cached": last_gamma_evt.isoformat() if last_gamma_evt else None,
+            "trailing_gap_days": gamma_evt_gap,
+        },
+        "gamma_markets": {
+            "cached_days": len(gamma_mkt_cached),
+            "last_cached": last_gamma_mkt.isoformat() if last_gamma_mkt else None,
+            "trailing_gap_days": gamma_mkt_gap,
+        },
+    }
+
+    if gamma_evt_gap > 1:
+        log.warning(
+            "Cache coverage gap: gamma_events last cached %s but backtest ends %s "
+            "(%d days missing at tail — will be fetched from Gamma API).",
+            last_gamma_evt or "never",
+            end,
+            gamma_evt_gap,
+        )
+    if gamma_mkt_gap > 1:
+        log.warning(
+            "Cache coverage gap: gamma_markets last cached %s but backtest ends %s "
+            "(%d days missing at tail — will be fetched from Gamma API).",
+            last_gamma_mkt or "never",
+            end,
+            gamma_mkt_gap,
+        )
+
+    if gamma_evt_gap <= 1 and gamma_mkt_gap <= 1:
+        log.info(
+            "Cache coverage OK: gamma data cached through %s (backtest end=%s).",
+            max(d for d in [last_gamma_evt, last_gamma_mkt] if d is not None),
+            end,
+        )
+
+    return report
 
 
 # =========================================================================
@@ -463,6 +545,109 @@ async def fetch_historical_forecast(
     )
 
 
+async def _probe_date_available(
+    latitude: float,
+    longitude: float,
+    probe_date: date,
+) -> bool:
+    """
+    Check if the ECMWF IFS ensemble historical forecast API has data for a date.
+
+    Makes a minimal single-member request to avoid unnecessary data transfer.
+    Returns True if the API responds with 200 and non-null data, False for
+    400/404/422 (date out of range) or any other failure.
+    """
+    lat_r = round(latitude, 4)
+    lon_r = round(longitude, 4)
+    params: dict = {
+        "latitude": lat_r,
+        "longitude": lon_r,
+        "daily": "temperature_2m_max_member00",
+        "timezone": "UTC",
+        "start_date": probe_date.isoformat(),
+        "end_date": probe_date.isoformat(),
+        "models": "ecmwf_ifs_ensemble",
+    }
+    if OPEN_METEO_API_KEY:
+        params["apikey"] = OPEN_METEO_API_KEY
+    try:
+        async with _get_open_meteo_sem():
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(OPEN_METEO_HISTORICAL, params=params)
+        if resp.status_code in (400, 404, 422):
+            return False
+        if resp.status_code != 200:
+            return False
+        vals = resp.json().get("daily", {}).get("temperature_2m_max_member00", [])
+        return bool(vals and vals[0] is not None)
+    except Exception:
+        return False
+
+
+async def get_earliest_available_date(
+    latitude: float,
+    longitude: float,
+) -> date | None:
+    """
+    Binary search for the earliest date the ECMWF IFS ensemble historical
+    forecast API has data for this location.
+
+    Searches between 2015-01-01 (known pre-data) and 2020-01-01 (known anchor).
+    Result is cached per (lat, lon) so only ~12 probe API calls are ever made
+    per location — all subsequent calls return instantly from cache.
+
+    Returns the earliest available date, or None if the anchor itself fails
+    (indicating the model is unavailable for this location entirely).
+    """
+    lat_r = round(latitude, 4)
+    lon_r = round(longitude, 4)
+
+    cache_k = _cache_key("ecmwf_ens51_earliest", str(lat_r), str(lon_r))
+    cached = _read_cache(cache_k)
+    if cached is not None:
+        return date.fromisoformat(cached["date"])
+
+    search_start = date(2015, 1, 1)
+    search_end = date(2020, 1, 1)  # anchor — should always have data
+
+    # Verify the anchor date is actually available
+    if not await _probe_date_available(latitude, longitude, search_end):
+        log.warning(
+            "ECMWF ensemble anchor %s unavailable for %s %s — "
+            "model may not cover this location; skipping earliest-date probe.",
+            search_end, lat_r, lon_r,
+        )
+        return None
+
+    # If data is available all the way back to search_start, cache that as the
+    # lower bound (data goes back further than we need to search).
+    if await _probe_date_available(latitude, longitude, search_start):
+        earliest = search_start
+        log.info(
+            "ECMWF ensemble data for %s %s available from at least %s (search_start)",
+            lat_r, lon_r, earliest,
+        )
+        _write_cache(cache_k, {"date": earliest.isoformat()})
+        return earliest
+
+    # Binary search: lo has no data, hi has data
+    lo, hi = search_start, search_end
+    while (hi - lo).days > 1:
+        mid = lo + timedelta(days=(hi - lo).days // 2)
+        if await _probe_date_available(latitude, longitude, mid):
+            hi = mid
+        else:
+            lo = mid
+
+    earliest = hi
+    log.info(
+        "ECMWF ensemble earliest available date for %s %s: %s",
+        lat_r, lon_r, earliest,
+    )
+    _write_cache(cache_k, {"date": earliest.isoformat()})
+    return earliest
+
+
 async def fetch_historical_ecmwf_ensemble(
     latitude: float,
     longitude: float,
@@ -480,6 +665,10 @@ async def fetch_historical_ecmwf_ensemble(
 
     Falls back to None if the API doesn't return at least 3 members, allowing
     the caller to fall back to the multi-model deterministic ensemble.
+
+    Short-circuits immediately (without any API call) for dates before the
+    known earliest available date, which is discovered once via binary search
+    and cached permanently per (lat, lon).
     """
     import numpy as np
 
@@ -497,6 +686,16 @@ async def fetch_historical_ecmwf_ensemble(
         if cached.get("_no_data"):
             return None
     else:
+        # Short-circuit if this date predates the known data window.
+        # get_earliest_available_date is a cache-first lookup after the first
+        # binary search (~12 probes), so this adds no overhead on reruns.
+        earliest = await get_earliest_available_date(latitude, longitude)
+        if earliest is not None and valid_date < earliest:
+            log.debug(
+                "ECMWF ensemble: skipping %s %s %s — before earliest available %s",
+                lat_r, lon_r, valid_date, earliest,
+            )
+            return None
         # ECMWF IFS ensemble: control (00) + 50 perturbed members
         member_vars = ",".join(
             f"temperature_2m_max_member{i:02d}" for i in range(51)
@@ -652,6 +851,18 @@ async def fetch_historical_forecast_ensemble(
     tmax_arr = np.array(tmax_all)
     tmin_arr = np.array(tmin_all) if tmin_all else None
 
+    # GFS/ECMWF divergence: collect per-model tmax values indexed by model name
+    # (each fetch_historical_forecast call returns a ForecastResult, not raw values).
+    # We reconstruct divergence from the individual model means stored in per_model_tmax.
+    per_model_tmax: dict[str, float] = {}
+    for m, fc in zip(models, results):
+        if fc is not None:
+            per_model_tmax[m] = fc.tmax_mean
+
+    model_divergence = 0.0
+    if _ECMWF_KEY in per_model_tmax and _GFS_KEY in per_model_tmax:
+        model_divergence = abs(per_model_tmax[_ECMWF_KEY] - per_model_tmax[_GFS_KEY])
+
     return ForecastResult(
         station_id="",
         valid_date=valid_date,
@@ -660,6 +871,7 @@ async def fetch_historical_forecast_ensemble(
         tmin_mean=float(np.mean(tmin_arr)) if tmin_arr is not None and len(tmin_arr) > 0 else None,
         tmin_std=float(max(1.0, np.std(tmin_arr))) if tmin_arr is not None and len(tmin_arr) > 1 else 1.5,
         models_used=used,
+        model_divergence=model_divergence,
     )
 
 
