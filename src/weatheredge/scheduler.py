@@ -172,7 +172,7 @@ async def _run_one_cycle(bankroll: float, calibrations: dict | None = None) -> N
     scan_time = datetime.utcnow()
 
     try:
-        signals, diag = await run_scan(
+        signals, markets_by_id, diag = await run_scan(
             bankroll=bankroll, calibrations=calibrations, diagnostics=True,
         )
     except Exception:
@@ -183,7 +183,7 @@ async def _run_one_cycle(bankroll: float, calibrations: dict | None = None) -> N
 
     # Log signals to database
     try:
-        written = await log_scan(signals, diag, scan_time)
+        written = await log_scan(signals, diag, scan_time, markets=markets_by_id)
     except Exception:
         logger.exception("Log FAILED — signals not persisted this cycle.")
         return

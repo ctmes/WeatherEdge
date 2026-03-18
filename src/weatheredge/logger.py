@@ -21,6 +21,7 @@ from weatheredge.models import (
     Forecast,
     Market,
     MarketPrice,
+    ParsedMarket,
     Signal,
 )
 from weatheredge.pipeline import ScanDiagnostics
@@ -36,6 +37,7 @@ async def log_scan(
     signals: Sequence[EdgeSignal],
     diagnostics: ScanDiagnostics | None = None,
     scan_time: datetime | None = None,
+    markets: dict[str, ParsedMarket] | None = None,
 ) -> int:
     """
     Persist one scan's results to the database.
@@ -58,7 +60,8 @@ async def log_scan(
 
         for market_id, sigs in market_signals.items():
             # ── Upsert Market ──────────────────────────────────────
-            await _upsert_market(session, sigs[0], scan_time)
+            market_data = markets.get(market_id) if markets else None
+            await _upsert_market(session, sigs[0], scan_time, market_data=market_data)
 
             # ── Insert Signals ─────────────────────────────────────
             for sig in sigs:
@@ -138,12 +141,25 @@ async def _upsert_market(
     session: AsyncSession,
     sig: EdgeSignal,
     scan_time: datetime,
+    market_data: ParsedMarket | None = None,
 ) -> None:
-    """Create or update a Market row from an EdgeSignal."""
+    """Create or update a Market row from an EdgeSignal + optional ParsedMarket."""
+    from datetime import datetime as _dt
+
     result = await session.execute(
         select(Market).where(Market.id == sig.market_id)
     )
     existing = result.scalar_one_or_none()
+
+    # Parse end_date string → datetime
+    end_date_dt = None
+    if market_data and market_data.end_date:
+        try:
+            end_date_dt = _dt.fromisoformat(
+                market_data.end_date.replace("Z", "+00:00")
+            ).replace(tzinfo=None)
+        except (ValueError, TypeError):
+            pass
 
     if existing is None:
         market = Market(
@@ -152,5 +168,30 @@ async def _upsert_market(
             station_id=sig.station_id,
             created_at=scan_time,
         )
+        if market_data:
+            market.metric = market_data.metric
+            market.bins = [list(b) for b in market_data.bins] if market_data.bins else None
+            market.outcomes = market_data.outcomes
+            market.outcome_prices = market_data.outcome_prices
+            market.token_ids = market_data.token_ids
+            market.volume = market_data.volume
+            market.description = market_data.description
+            market.timezone = market_data.timezone
+            market.resolution_date = market_data.resolution_date
+            market.end_date = end_date_dt
         session.add(market)
-    # If it already exists we leave it — question/station don't change.
+    else:
+        # Update metadata fields that may have been missing on first insert
+        if market_data:
+            if existing.metric is None and market_data.metric:
+                existing.metric = market_data.metric
+            if existing.bins is None and market_data.bins:
+                existing.bins = [list(b) for b in market_data.bins]
+            if existing.outcomes is None and market_data.outcomes:
+                existing.outcomes = market_data.outcomes
+            if existing.outcome_prices is None and market_data.outcome_prices:
+                existing.outcome_prices = market_data.outcome_prices
+            if existing.resolution_date is None and market_data.resolution_date:
+                existing.resolution_date = market_data.resolution_date
+            if existing.end_date is None and end_date_dt:
+                existing.end_date = end_date_dt

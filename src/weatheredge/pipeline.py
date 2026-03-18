@@ -69,7 +69,7 @@ async def run_scan(
     diagnostics: bool = False,
     orderbooks: dict[str, OrderbookSnapshot] | None = None,
     deep_scan: bool = False,
-) -> tuple[list[EdgeSignal], ScanDiagnostics | None]:
+) -> tuple[list[EdgeSignal], dict[str, ParsedMarket], ScanDiagnostics | None]:
     """
     Execute one full pipeline scan with calibration and regime checks.
 
@@ -88,7 +88,14 @@ async def run_scan(
 
     if not markets:
         logger.warning("No weather markets found — nothing to scan.")
-        return [], diag
+        return [], {}, diag
+
+    # Skip already-resolved markets (one outcome price is near 1.0 — market has settled)
+    before = len(markets)
+    markets = [m for m in markets if not m.outcome_prices or max(m.outcome_prices) < 0.95]
+    skipped = before - len(markets)
+    if skipped:
+        logger.info("Skipped %d already-resolved markets (max outcome price ≥ 0.95)", skipped)
 
     station_markets: dict[str, list[ParsedMarket]] = {}
     unmatched_markets: list[ParsedMarket] = []
@@ -210,8 +217,10 @@ async def run_scan(
     if diag:
         diag.signals_above_threshold = len(all_signals)
 
+    markets_by_id: dict[str, ParsedMarket] = {m.condition_id: m for m in markets}
+
     logger.info("Scan complete — %d signals above threshold", len(all_signals))
-    return all_signals, diag
+    return all_signals, markets_by_id, diag
 
 
 # =========================================================================

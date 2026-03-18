@@ -7,6 +7,7 @@ Launch:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -55,6 +56,21 @@ def _cutoff(tf_key: str) -> str | None:
     if delta is None:
         return None
     return (datetime.utcnow() - delta).isoformat()
+
+
+def _bin_label(outcomes_json, bin_index) -> str:
+    """Return the outcome label for a given bin index."""
+    try:
+        outcomes = outcomes_json
+        if isinstance(outcomes, str):
+            outcomes = json.loads(outcomes)
+        if isinstance(outcomes, list):
+            idx = int(bin_index) if bin_index is not None else 0
+            if 0 <= idx < len(outcomes):
+                return str(outcomes[idx])
+    except Exception:
+        pass
+    return f"Bin {bin_index}"
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +179,7 @@ def main() -> None:
     trades_raw = _query("""
         SELECT
             s.model_prob, s.market_prob, s.edge, s.bet_size_usd, s.kelly_fraction,
+            s.bin_index, m.outcomes,
             m.station_id, m.metric,
             r.won, r.pnl_usd, r.actual_slippage, r.resolved_at
         FROM results r
@@ -328,18 +345,19 @@ def main() -> None:
                 m.station_id as station,
                 m.metric,
                 m.question,
+                s.bin_index,
+                m.outcomes,
                 ROUND(s.model_prob * 100, 1) as model_pct,
                 ROUND(s.market_prob * 100, 1) as mkt_pct,
                 ROUND(s.edge * 100, 1) as edge_pct,
                 ROUND(s.kelly_fraction * 100, 2) as kelly_pct,
                 ROUND(s.bet_size_usd, 2) as bet_usd,
-                s.signal_type as type
+                m.end_date
             FROM signals s
             JOIN markets m ON s.market_id = m.id
             LEFT JOIN results r ON r.signal_id = s.id
             WHERE r.id IS NULL
               AND s.signal_type != 'backtest'
-              AND (m.end_date IS NULL OR m.end_date > datetime('now', '-2 days'))
               AND s.id = (
                   SELECT id FROM signals s2
                   WHERE s2.market_id = s.market_id
@@ -352,13 +370,19 @@ def main() -> None:
         """)
 
         if len(active_df):
+            active_df["bet_outcome"] = active_df.apply(
+                lambda r: _bin_label(r["outcomes"], r["bin_index"]), axis=1
+            )
+            display_cols = ["opened", "station", "metric", "question", "bet_outcome",
+                            "model_pct", "mkt_pct", "edge_pct", "kelly_pct", "bet_usd", "end_date"]
+            display_active = active_df[[c for c in display_cols if c in active_df.columns]]
             total_exposure = active_df["bet_usd"].sum()
             avg_pos_edge = active_df["edge_pct"].mean()
             p1, p2, p3 = st.columns(3)
             p1.metric("Open Positions", str(len(active_df)))
             p2.metric("Total Exposure", f"${total_exposure:,.2f}")
             p3.metric("Avg Edge", f"{avg_pos_edge:.1f}%")
-            st.dataframe(active_df, use_container_width=True, hide_index=True)
+            st.dataframe(display_active, use_container_width=True, hide_index=True)
         else:
             st.caption("No open positions.")
 
@@ -521,6 +545,8 @@ def main() -> None:
                 m.station_id as station,
                 m.metric,
                 m.question,
+                s.bin_index,
+                m.outcomes,
                 ROUND(s.model_prob * 100, 1) as model_pct,
                 ROUND(s.market_prob * 100, 1) as mkt_pct,
                 ROUND(s.edge * 100, 1) as edge_pct,
@@ -538,7 +564,15 @@ def main() -> None:
         """, (cutoff, cutoff))
 
         if len(recent_df):
-            st.dataframe(recent_df, use_container_width=True, hide_index=True)
+            recent_df["bet_outcome"] = recent_df.apply(
+                lambda r: _bin_label(r["outcomes"], r["bin_index"]), axis=1
+            )
+            display_cols = ["resolved", "station", "metric", "question", "bet_outcome",
+                            "model_pct", "mkt_pct", "edge_pct", "bet_usd", "won", "pnl_usd", "slip_pct"]
+            st.dataframe(
+                recent_df[[c for c in display_cols if c in recent_df.columns]],
+                use_container_width=True, hide_index=True
+            )
         else:
             st.caption("No resolved trades in this window.")
 
@@ -566,12 +600,13 @@ def main() -> None:
         else:
             st.caption("No Brier scores in this window.")
 
-    # ── Auto-refresh ──────────────────────────────────────────────
+    # ── Auto-refresh (preserves tab state via st.rerun, not browser reload) ──
     if refresh_interval:
-        st.markdown(
-            f'<meta http-equiv="refresh" content="{refresh_interval}">',
-            unsafe_allow_html=True,
-        )
+        try:
+            from streamlit_autorefresh import st_autorefresh
+            st_autorefresh(interval=refresh_interval * 1000, key="auto_refresh")
+        except ImportError:
+            st.sidebar.caption("Install `streamlit-autorefresh` for tab-safe refresh.")
 
 
 # ---------------------------------------------------------------------------

@@ -433,7 +433,7 @@ def main() -> None:
 
 def _run_scan(args: argparse.Namespace) -> None:
 
-    signals, _ = asyncio.run(run_scan(
+    signals, _, _ = asyncio.run(run_scan(
         bankroll=args.bankroll,
         deep_scan=args.deep_scan,
     ))
@@ -464,7 +464,7 @@ def _run_scan(args: argparse.Namespace) -> None:
 
 def _run_diagnose(args: argparse.Namespace) -> None:
 
-    signals, diag = asyncio.run(
+    signals, _, diag = asyncio.run(
         run_scan(
             bankroll=args.bankroll,
             diagnostics=True,
