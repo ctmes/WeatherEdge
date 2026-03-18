@@ -701,11 +701,14 @@ def main() -> None:
                 ROUND(s.model_prob * 100, 1) as model_pct,
                 ROUND(s.market_prob * 100, 1) as bet_price_pct,
                 ROUND(
-                    (SELECT CAST(json_extract(mp.prices, '$.' || CAST(s.bin_index AS TEXT)) AS REAL)
-                     FROM market_prices mp
-                     WHERE mp.market_id = s.market_id
-                     ORDER BY mp.recorded_at DESC
-                     LIMIT 1) * 100,
+                    COALESCE(
+                        (SELECT CAST(json_extract(mp.prices, '$.' || CAST(s.bin_index AS TEXT)) AS REAL)
+                         FROM market_prices mp
+                         WHERE mp.market_id = s.market_id
+                         ORDER BY mp.recorded_at DESC
+                         LIMIT 1),
+                        CAST(json_extract(m.outcome_prices, '$[' || CAST(s.bin_index AS TEXT) || ']') AS REAL)
+                    ) * 100,
                 1) as curr_price_pct,
                 ROUND(s.edge * 100, 1) as edge_pct,
                 ROUND(s.kelly_fraction * 100, 2) as kelly_pct,
