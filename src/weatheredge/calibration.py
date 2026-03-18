@@ -347,7 +347,10 @@ async def run_calibration(
             bias = StationBias(**bias_dict)
             return bias, cached["metrics"]
         except Exception as e:
-            logger.debug(f"Failed to load cached calibration for {station_id}: {e}")
+            logger.warning(
+                "Cached calibration for %s is corrupt or unreadable (%s) — recomputing from raw data.",
+                station_id, e,
+            )
 
     station = get_station(station_id)
     if not station:

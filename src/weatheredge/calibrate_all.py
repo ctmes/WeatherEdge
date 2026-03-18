@@ -48,7 +48,7 @@ async def sync_cache_to_db() -> dict[str, str]:
             if prev is None or bias.n_observations > prev.n_observations:
                 best[sid] = bias
         except Exception as e:
-            logger.debug("Skipping %s: %s", path.name, e)
+            logger.warning("Skipping corrupt or unreadable cache file %s: %s", path.name, e)
 
     if not best:
         logger.warning("No valid calibration cache files found in %s", _CACHE_DIR)

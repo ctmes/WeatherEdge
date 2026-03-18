@@ -14,6 +14,7 @@ when a trade fires. The live orderbook price is always fresh (WebSocket, seconds
 
 import asyncio
 import logging
+import signal as _signal
 from datetime import datetime, timedelta
 from typing import Dict, List
 
@@ -133,7 +134,12 @@ async def run_live_paper(
                     logger.critical("CIRCUIT BREAKER — %s: %s", cb_status, cb_msg)
                 _state["circuit_status"] = cb_status
             except Exception:
-                logger.exception("Circuit breaker check failed — continuing.")
+                logger.critical(
+                    "Circuit breaker check failed — pausing trading as a precaution. "
+                    "Fix the underlying error and restart the daemon.",
+                    exc_info=True,
+                )
+                _state["circuit_status"] = "PAUSE"
 
             last_market_refresh = datetime.utcnow()
             logger.info("Metadata refresh complete for %d stations.", len(unique_stations))
@@ -192,8 +198,19 @@ async def run_live_paper(
 
     ws_task.add_done_callback(_ws_task_done)
 
+    _running = True
+
+    def _stop():
+        nonlocal _running
+        logger.info("Received shutdown signal — stopping live-paper daemon after current cycle.")
+        _running = False
+
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(_signal.SIGTERM, _stop)
+    loop.add_signal_handler(_signal.SIGINT, _stop)
+
     try:
-        while True:
+        while _running:
             # ── Safety guards: check before every evaluation cycle ─────────
             if _state["ws_failed"]:
                 logger.critical(
@@ -235,7 +252,11 @@ async def run_live_paper(
                 # refresh_metadata ran but the per-station fetch failed silently.
                 fetched_at = forecast_fetched_at.get(sid)
                 if fetched_at is None:
-                    logger.debug("Skipping %s — no forecast fetch timestamp recorded yet.", sid)
+                    logger.warning(
+                        "Skipping %s — forecast has never been successfully fetched. "
+                        "Check API connectivity; will retry after next metadata refresh.",
+                        sid,
+                    )
                     continue
                 forecast_age_secs = (now - fetched_at).total_seconds()
                 if forecast_age_secs > _FORECAST_MAX_AGE_SECS:

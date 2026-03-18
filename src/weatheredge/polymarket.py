@@ -292,7 +292,7 @@ async def _fetch_gamma_events(params: dict) -> list[ParsedMarket]:
                 markets.append(parsed)
         return markets
     except Exception as e:
-        log.debug("Gamma targeted event fetch failed (%s): %s", params, e)
+        log.warning("Gamma targeted event fetch failed (%s): %s", params, e)
         return []
 
 
@@ -310,7 +310,7 @@ async def _fetch_gamma_markets(params: dict) -> list[ParsedMarket]:
                     markets.append(parsed)
         return markets
     except Exception as e:
-        log.debug("Gamma targeted market fetch failed (%s): %s", params, e)
+        log.warning("Gamma targeted market fetch failed (%s): %s", params, e)
         return []
 
 
@@ -664,8 +664,8 @@ def parse_resolution_rules(
                     break
                 except ValueError:
                     continue
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("Failed to parse resolution date from %r: %s", question, e)
 
     return result
 
@@ -788,7 +788,8 @@ async def fetch_midpoint_prices(token_ids: list[str]) -> dict[str, float]:
         if result:
             write_cache(_SUBDIR, ck, result)
         return result
-    except Exception:
+    except Exception as e:
+        log.warning("Failed to fetch CLOB midpoints for %d token(s): %s", len(token_ids), e)
         return {}
 
 

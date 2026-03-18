@@ -186,6 +186,16 @@ class BacktestRun(Base):
     brier_scores = relationship("BrierScore", back_populates="backtest_run")
 
 
+class PeakBankroll(Base):
+    """Single-row table storing the historical peak bankroll for drawdown tracking."""
+
+    __tablename__ = "peak_bankroll"
+
+    id = Column(Integer, primary_key=True, default=1)
+    peak_usd = Column(Float, nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
 class BrierScore(Base):
     """Brier scores per model per market."""
 

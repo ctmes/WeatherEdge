@@ -433,10 +433,15 @@ async def get_pnl_summary(session: AsyncSession, bankroll: float) -> dict[str, f
     Return P&L sums for circuit breaker checks.
 
     Queries resolved Results over 24h, 7d, and 30d windows plus an all-time
-    total used to estimate current and peak bankroll.
+    total used to estimate current bankroll.
+
+    Peak bankroll is tracked persistently in the ``peak_bankroll`` table so
+    drawdown is measured from the true historical high-water mark rather than
+    recalculated on each call (which would incorrectly reset the peak after
+    equity drops).
     """
     from sqlalchemy import select, func
-    from weatheredge.models import Result
+    from weatheredge.models import PeakBankroll, Result
     from datetime import timedelta
 
     now = datetime.utcnow()
@@ -455,7 +460,19 @@ async def get_pnl_summary(session: AsyncSession, bankroll: float) -> dict[str, f
         await session.scalar(select(func.sum(Result.pnl_usd))) or 0.0
     )
     current = bankroll + all_time
-    peak = max(bankroll, current)
+
+    # Persistent high-water mark: read, then update if current exceeds it.
+    peak_row = await session.get(PeakBankroll, 1)
+    if peak_row is None:
+        peak_row = PeakBankroll(id=1, peak_usd=current)
+        session.add(peak_row)
+        peak = current
+    else:
+        peak = peak_row.peak_usd
+        if current > peak:
+            peak_row.peak_usd = current
+            peak_row.updated_at = now
+            peak = current
 
     return {
         "daily_pnl": daily,

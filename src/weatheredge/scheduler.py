@@ -138,7 +138,12 @@ async def run_loop(
                 await asyncio.sleep(24 * 3600)
                 continue
         except Exception:
-            logger.exception("Circuit breaker check failed — continuing.")
+            logger.critical(
+                "Circuit breaker check failed — halting scheduler as a precaution. "
+                "Fix the underlying error and restart.",
+                exc_info=True,
+            )
+            _running = False
 
         if once:
             logger.info("Single-cycle mode — exiting.")

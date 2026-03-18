@@ -46,7 +46,8 @@ def read_cache(subdir: str, key: str, *, max_age_hours: float | None = None) -> 
 
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as e:
+        log.warning("Cache file %s is unreadable or corrupt (%s) — treating as cache miss.", path, e)
         return None
 
 

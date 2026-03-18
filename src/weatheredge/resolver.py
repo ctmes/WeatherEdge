@@ -62,7 +62,11 @@ async def check_resolutions() -> int:
             try:
                 outcome = await _fetch_resolved_outcome(market_id)
             except Exception:
-                logger.debug("Market %s not yet resolved or fetch failed.", market_id)
+                logger.warning(
+                    "Failed to fetch resolution status for market %s — will retry next cycle.",
+                    market_id,
+                    exc_info=True,
+                )
                 continue
 
             if outcome is None:
