@@ -8,6 +8,7 @@ Launch:
 from __future__ import annotations
 
 import sqlite3
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -168,12 +169,22 @@ def main() -> None:
                 conn.close()
                 st.rerun()
 
+        st.divider()
+        _REFRESH_OPTIONS = {"Off": 0, "30s": 30, "1 min": 60, "5 min": 300}
+        _refresh_label = st.selectbox(
+            "Auto-refresh",
+            list(_REFRESH_OPTIONS.keys()),
+            index=1,
+        )
+        refresh_interval = _REFRESH_OPTIONS[_refresh_label]
+
         st.caption(f"DB: `{Path(db_path).name}`")
 
     # ── Header ────────────────────────────────────────────────────
     st.markdown("# WeatherEdge")
+    _refresh_note = f"· refreshes every {_refresh_label}" if refresh_interval else "· auto-refresh off"
     st.caption(
-        f"{tf}  ·  {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+        f"{tf}  ·  {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}  {_refresh_note}"
     )
 
     # ── Metrics ───────────────────────────────────────────────────
@@ -293,6 +304,11 @@ def main() -> None:
         st.dataframe(trades_df, use_container_width=True, hide_index=True)
     else:
         st.caption("No resolved trades in this window.")
+
+    # ── Auto-refresh ──────────────────────────────────────────────
+    if refresh_interval:
+        time.sleep(refresh_interval)
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------
