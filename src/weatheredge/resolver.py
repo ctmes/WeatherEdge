@@ -249,11 +249,16 @@ async def _fetch_observed_outcome(session, market: Market) -> dict[str, Any] | N
         logger.debug("Observation value is None for %s %s on %s.", market.station_id, metric, res_date)
         return None
 
-    bins = market.bins  # [{low, high}, ...]
+    bins = market.bins  # [{low, high}, ...] or [[low, high], ...]
     resolved_bin = None
     for i, b in enumerate(bins):
-        low = b.get("low")
-        high = b.get("high")
+        if isinstance(b, dict):
+            low = b.get("low")
+            high = b.get("high")
+        else:
+            # list format [low, high]
+            low = b[0] if len(b) > 0 else None
+            high = b[1] if len(b) > 1 else None
         # Handle unbounded edges
         below = (low is None or observed_val >= low)
         above = (high is None or observed_val < high)
