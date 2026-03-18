@@ -102,6 +102,26 @@ _CSS = """
         padding-bottom: 3rem;
     }
 
+    /* ── Sidebar toggle — hide raw icon text ───────────────────────────── */
+    /* The Material Symbols font sometimes fails to load, showing raw text  */
+    [data-testid="stSidebarCollapsedControl"],
+    [data-testid="stSidebarCollapsedControl"] button,
+    [data-testid="stSidebarCollapsedControl"] span {
+        font-size: 0 !important;
+        width: 28px !important;
+        height: 28px !important;
+        overflow: hidden !important;
+    }
+    [data-testid="stSidebarCollapsedControl"] button::after {
+        content: "›";
+        font-size: 18px;
+        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+        color: #86868B;
+        line-height: 28px;
+        display: block;
+        text-align: center;
+    }
+
     /* ── Sidebar (admin only) ──────────────────────────────────────────── */
     section[data-testid="stSidebar"] {
         background: rgba(255, 255, 255, 0.96);
