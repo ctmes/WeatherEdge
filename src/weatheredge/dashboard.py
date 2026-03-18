@@ -240,6 +240,15 @@ def main() -> None:
         JOIN markets m ON s.market_id = m.id
         LEFT JOIN results r ON r.signal_id = s.id
         WHERE r.id IS NULL
+          AND s.signal_type != 'backtest'
+          AND s.id = (
+              SELECT id FROM signals s2
+              WHERE s2.market_id = s.market_id
+                AND s2.bin_index = s.bin_index
+                AND s2.signal_type != 'backtest'
+              ORDER BY s2.created_at DESC
+              LIMIT 1
+          )
         ORDER BY s.created_at DESC
     """)
 
