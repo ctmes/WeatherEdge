@@ -389,6 +389,7 @@ _POSITION_COL_CONFIG = {
     "kelly_pct":      st.column_config.NumberColumn("Kelly %",      format="%.2f%%"),
     "bet_usd":        st.column_config.NumberColumn("Bet ($)",       format="$%.2f"),
     "wtd_ev_usd":     st.column_config.NumberColumn("EV ($)",        format="$%.2f"),
+    "exp_return_usd": st.column_config.NumberColumn("Exp. Return ($)", format="$%.2f"),
 }
 
 _TRADES_COL_CONFIG = {
@@ -739,23 +740,30 @@ def main() -> None:
             active_df["price_chg_pct"] = (
                 active_df["curr_price_pct"] - active_df["bet_price_pct"]
             ).round(1)
+            # Expected return per position = (model_prob / bet_price) × bet_size
+            active_df["exp_return_usd"] = (
+                (active_df["model_pct"] / active_df["bet_price_pct"]) * active_df["bet_usd"]
+            ).round(2)
             total_exposure = active_df["bet_usd"].sum()
             avg_pos_edge = active_df["edge_pct"].mean()
             portfolio_ev = active_df["wtd_ev_usd"].sum()
+            total_exp_return = active_df["exp_return_usd"].sum()
 
-            p1, p2, p3, p4, *_ = st.columns(6)
+            p1, p2, p3, p4, p5, *_ = st.columns(6)
             _kpi(p1, "Open Positions", str(len(active_df)), color=_BLUE)
             _kpi(p2, "Total Exposure", f"${total_exposure:,.2f}")
             _kpi(p3, "Avg Edge", f"{avg_pos_edge:.1f}%", color=_BLUE)
             _ev_col = _GREEN if portfolio_ev > 0 else _RED if portfolio_ev < 0 else "#1D1D1F"
             _kpi(p4, "Portfolio EV", f"${portfolio_ev:,.2f}", color=_ev_col,
                  sub="Σ edge × bet size")
+            _kpi(p5, "Exp. Return", f"${total_exp_return:,.2f}", color=_GREEN,
+                 sub="Σ (model/price) × bet")
 
             st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
             display_cols = ["opened", "station", "metric", "market", "bet_outcome",
                             "model_pct", "bet_price_pct", "curr_price_pct", "price_chg_pct",
-                            "edge_pct", "kelly_pct", "bet_usd", "wtd_ev_usd", "end_date"]
+                            "edge_pct", "kelly_pct", "bet_usd", "wtd_ev_usd", "exp_return_usd", "end_date"]
             st.dataframe(
                 active_df[[c for c in display_cols if c in active_df.columns]],
                 use_container_width=True,
