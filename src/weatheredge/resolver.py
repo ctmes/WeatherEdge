@@ -159,6 +159,9 @@ async def _fetch_resolved_outcome(market_id: str) -> dict[str, Any] | None:
 
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(url)
+        if resp.status_code == 404:
+            logger.debug("Market %s not found on Polymarket (404) — will try observation fallback.", market_id)
+            return None
         resp.raise_for_status()
         data = resp.json()
 
