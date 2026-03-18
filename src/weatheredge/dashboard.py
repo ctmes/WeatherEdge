@@ -361,20 +361,23 @@ def _section(container, title: str, caption: str = "") -> None:
 
 
 _POSITION_COL_CONFIG = {
-    "model_pct": st.column_config.NumberColumn("Model %", format="%.1f%%"),
-    "mkt_pct":   st.column_config.NumberColumn("Mkt %",   format="%.1f%%"),
-    "edge_pct":  st.column_config.NumberColumn("Edge %",  format="%.1f%%"),
-    "kelly_pct": st.column_config.NumberColumn("Kelly %", format="%.2f%%"),
-    "bet_usd":   st.column_config.NumberColumn("Bet ($)",  format="$%.2f"),
+    "model_pct":      st.column_config.NumberColumn("Model %",      format="%.1f%%"),
+    "bet_price_pct":  st.column_config.NumberColumn("Bet Price %",  format="%.1f%%"),
+    "curr_price_pct": st.column_config.NumberColumn("Curr Price %", format="%.1f%%"),
+    "price_chg_pct":  st.column_config.NumberColumn("Δ Price %",    format="%.1f%%"),
+    "edge_pct":       st.column_config.NumberColumn("Edge %",       format="%.1f%%"),
+    "kelly_pct":      st.column_config.NumberColumn("Kelly %",      format="%.2f%%"),
+    "bet_usd":        st.column_config.NumberColumn("Bet ($)",       format="$%.2f"),
+    "wtd_ev_usd":     st.column_config.NumberColumn("EV ($)",        format="$%.2f"),
 }
 
 _TRADES_COL_CONFIG = {
-    "model_pct": st.column_config.NumberColumn("Model %", format="%.1f%%"),
-    "mkt_pct":   st.column_config.NumberColumn("Mkt %",   format="%.1f%%"),
-    "edge_pct":  st.column_config.NumberColumn("Edge %",  format="%.1f%%"),
-    "bet_usd":   st.column_config.NumberColumn("Bet ($)",  format="$%.2f"),
-    "pnl_usd":   st.column_config.NumberColumn("P&L ($)",  format="$%.2f"),
-    "slip_pct":  st.column_config.NumberColumn("Slip %",   format="%.3f%%"),
+    "model_pct": st.column_config.NumberColumn("Model %",     format="%.1f%%"),
+    "mkt_pct":   st.column_config.NumberColumn("Bet Price %", format="%.1f%%"),
+    "edge_pct":  st.column_config.NumberColumn("Edge %",      format="%.1f%%"),
+    "bet_usd":   st.column_config.NumberColumn("Bet ($)",      format="$%.2f"),
+    "pnl_usd":   st.column_config.NumberColumn("P&L ($)",      format="$%.2f"),
+    "slip_pct":  st.column_config.NumberColumn("Slip %",       format="%.3f%%"),
 }
 
 
@@ -501,9 +504,13 @@ def main() -> None:
         expectancy = total_pnl / n
         avg_edge = float(trades_raw["edge"].mean())
         win_ci = analytics.win_rate_confidence_interval(wins, n)
+        total_bet_usd = float(trades_raw["bet_size_usd"].sum())
+        total_ev_usd = float((trades_raw["edge"] * trades_raw["bet_size_usd"]).sum())
+        wtd_avg_edge = total_ev_usd / total_bet_usd if total_bet_usd > 0 else 0.0
     else:
         wins = losses = 0
         total_pnl = win_rate = avg_win = avg_loss = profit_factor = expectancy = avg_edge = 0.0
+        total_ev_usd = wtd_avg_edge = 0.0
         win_ci = (0.0, 1.0)
 
     avg_brier_val = (
@@ -604,6 +611,19 @@ def main() -> None:
              f"{bss:+.1%}" if bss is not None else "—",
              color=_bss_color)
 
+        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+
+        d1, d2, _d3, _d4, _d5, _d6 = st.columns(6)
+        _kpi(d1, "Wtd Avg Edge",
+             f"{wtd_avg_edge:.1%}" if n else "—",
+             color=_BLUE if n else "#1D1D1F",
+             sub="size-weighted edge")
+        _ev_color = _GREEN if total_ev_usd > 0 else _RED if total_ev_usd < 0 else "#1D1D1F"
+        _kpi(d2, "Total Exp. EV",
+             f"${total_ev_usd:,.2f}" if n else "—",
+             color=_ev_color,
+             sub="Σ edge × bet size")
+
         st.divider()
 
         # ── Charts ────────────────────────────────────────────────
@@ -659,10 +679,18 @@ def main() -> None:
                 s.bin_index,
                 m.outcomes,
                 ROUND(s.model_prob * 100, 1) as model_pct,
-                ROUND(s.market_prob * 100, 1) as mkt_pct,
+                ROUND(s.market_prob * 100, 1) as bet_price_pct,
+                ROUND(
+                    (SELECT CAST(json_extract(mp.prices, '$.' || CAST(s.bin_index AS TEXT)) AS REAL)
+                     FROM market_prices mp
+                     WHERE mp.market_id = s.market_id
+                     ORDER BY mp.recorded_at DESC
+                     LIMIT 1) * 100,
+                1) as curr_price_pct,
                 ROUND(s.edge * 100, 1) as edge_pct,
                 ROUND(s.kelly_fraction * 100, 2) as kelly_pct,
                 ROUND(s.bet_size_usd, 2) as bet_usd,
+                ROUND(s.edge * s.bet_size_usd, 2) as wtd_ev_usd,
                 m.end_date
             FROM signals s
             JOIN markets m ON s.market_id = m.id
@@ -684,18 +712,27 @@ def main() -> None:
             active_df["bet_outcome"] = active_df.apply(
                 lambda r: _bin_label(r["outcomes"], r["bin_index"]), axis=1
             )
+            # Δ Price = how much the market has moved since we entered
+            active_df["price_chg_pct"] = (
+                active_df["curr_price_pct"] - active_df["bet_price_pct"]
+            ).round(1)
             total_exposure = active_df["bet_usd"].sum()
             avg_pos_edge = active_df["edge_pct"].mean()
+            portfolio_ev = active_df["wtd_ev_usd"].sum()
 
-            p1, p2, p3, *_ = st.columns(6)
+            p1, p2, p3, p4, *_ = st.columns(6)
             _kpi(p1, "Open Positions", str(len(active_df)), color=_BLUE)
             _kpi(p2, "Total Exposure", f"${total_exposure:,.2f}")
             _kpi(p3, "Avg Edge", f"{avg_pos_edge:.1f}%", color=_BLUE)
+            _ev_col = _GREEN if portfolio_ev > 0 else _RED if portfolio_ev < 0 else "#1D1D1F"
+            _kpi(p4, "Portfolio EV", f"${portfolio_ev:,.2f}", color=_ev_col,
+                 sub="Σ edge × bet size")
 
             st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
             display_cols = ["opened", "station", "metric", "market", "bet_outcome",
-                            "model_pct", "mkt_pct", "edge_pct", "kelly_pct", "bet_usd", "end_date"]
+                            "model_pct", "bet_price_pct", "curr_price_pct", "price_chg_pct",
+                            "edge_pct", "kelly_pct", "bet_usd", "wtd_ev_usd", "end_date"]
             st.dataframe(
                 active_df[[c for c in display_cols if c in active_df.columns]],
                 use_container_width=True,
