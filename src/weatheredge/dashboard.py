@@ -79,40 +79,153 @@ def _bin_label(outcomes_json, bin_index) -> str:
 
 _CSS = """
 <style>
-    .stApp { background: #ffffff; }
-    section[data-testid="stSidebar"] {
-        background: #fafafa;
-        border-right: 1px solid #e8e8e8;
+    /* ── Base ──────────────────────────────────────────────────────────── */
+    * {
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display",
+                     "SF Pro Text", "Helvetica Neue", Arial, sans-serif !important;
     }
+    .stApp { background: #F5F5F7; }
+
+    .main .block-container {
+        padding-top: 2.25rem;
+        padding-bottom: 3rem;
+    }
+
+    /* ── Sidebar ───────────────────────────────────────────────────────── */
+    section[data-testid="stSidebar"] {
+        background: rgba(255, 255, 255, 0.92);
+        border-right: 1px solid rgba(0, 0, 0, 0.07);
+    }
+
+    /* ── Metric cards ──────────────────────────────────────────────────── */
     [data-testid="stMetric"] {
-        background: #fafafa;
-        border: 1px solid #e8e8e8;
-        border-radius: 10px;
-        padding: 18px 20px;
+        background: #FFFFFF;
+        border: 1px solid rgba(0, 0, 0, 0.06);
+        border-radius: 16px;
+        padding: 20px 22px;
+        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04);
     }
     [data-testid="stMetricLabel"] {
-        color: #8b8b8b;
-        font-size: 0.75rem;
+        color: #86868B;
+        font-size: 0.68rem;
         text-transform: uppercase;
-        letter-spacing: 0.06em;
-        font-weight: 500;
+        letter-spacing: 0.09em;
+        font-weight: 600;
     }
     [data-testid="stMetricValue"] {
         font-weight: 600;
-        font-size: 1.5rem;
-        color: #1a1a1a;
+        font-size: 1.55rem;
+        color: #1D1D1F;
+        letter-spacing: -0.02em;
     }
-    h1 { color: #1a1a1a !important; font-weight: 600 !important; font-size: 1.6rem !important; }
-    h3 { color: #1a1a1a !important; font-weight: 600 !important; font-size: 1.05rem !important; margin-bottom: 0.25rem !important; }
-    div[data-testid="stDataFrame"] { border: 1px solid #e8e8e8; border-radius: 8px; }
-    hr { border-color: #f0f0f0 !important; }
-    .stCaption, [data-testid="stCaptionContainer"] { color: #999 !important; }
-    .stTabs [data-baseweb="tab-list"] { gap: 6px; }
+    [data-testid="stMetricDelta"] svg { display: none; }
+    [data-testid="stMetricDelta"] > div {
+        color: #86868B !important;
+        font-size: 0.72rem;
+        font-weight: 500;
+        letter-spacing: 0.01em;
+    }
+
+    /* ── Typography ────────────────────────────────────────────────────── */
+    h1 {
+        color: #1D1D1F !important;
+        font-weight: 700 !important;
+        font-size: 1.75rem !important;
+        letter-spacing: -0.03em !important;
+    }
+    h2 {
+        color: #1D1D1F !important;
+        font-weight: 600 !important;
+        letter-spacing: -0.02em !important;
+    }
+    h3 {
+        color: #1D1D1F !important;
+        font-weight: 600 !important;
+        font-size: 0.95rem !important;
+        letter-spacing: -0.01em !important;
+        margin-bottom: 0.4rem !important;
+    }
+
+    /* ── Dividers ──────────────────────────────────────────────────────── */
+    hr {
+        border: none !important;
+        border-top: 1px solid rgba(0, 0, 0, 0.07) !important;
+        margin: 1.4rem 0 !important;
+    }
+
+    /* ── Captions ──────────────────────────────────────────────────────── */
+    .stCaption, [data-testid="stCaptionContainer"] {
+        color: #86868B !important;
+        font-size: 0.78rem !important;
+    }
+
+    /* ── DataFrames ────────────────────────────────────────────────────── */
+    div[data-testid="stDataFrame"] {
+        border: 1px solid rgba(0, 0, 0, 0.06) !important;
+        border-radius: 12px;
+        overflow: hidden;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+        background: #FFFFFF;
+    }
+
+    /* ── Charts ────────────────────────────────────────────────────────── */
+    [data-testid="stArrowVegaLiteChart"],
+    [data-testid="stVegaLiteChart"] {
+        background: #FFFFFF;
+        border-radius: 14px;
+        padding: 6px 8px;
+        border: 1px solid rgba(0, 0, 0, 0.06);
+        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.05);
+    }
+
+    /* ── Tabs — segmented-control style ───────────────────────────────── */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 0;
+        background: rgba(0, 0, 0, 0.05);
+        border-radius: 10px;
+        padding: 3px;
+    }
     .stTabs [data-baseweb="tab"] {
-        background: #fafafa;
-        border: 1px solid #e8e8e8;
-        border-radius: 6px;
-        padding: 6px 18px;
+        background: transparent;
+        border: none;
+        border-radius: 8px;
+        padding: 7px 22px;
+        color: #6E6E73;
+        font-weight: 500;
+        font-size: 0.875rem;
+        letter-spacing: -0.01em;
+    }
+    .stTabs [aria-selected="true"] {
+        background: #FFFFFF !important;
+        color: #1D1D1F !important;
+        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.14), 0 1px 2px rgba(0, 0, 0, 0.08) !important;
+    }
+
+    /* ── Selectbox / inputs ────────────────────────────────────────────── */
+    [data-testid="stSelectbox"] > div > div {
+        border-radius: 8px !important;
+        border-color: rgba(0, 0, 0, 0.1) !important;
+        background: #FFFFFF !important;
+    }
+
+    /* ── Buttons ───────────────────────────────────────────────────────── */
+    [data-testid="stButton"] > button {
+        border-radius: 8px !important;
+        border-color: rgba(0, 0, 0, 0.1) !important;
+        background: #FFFFFF !important;
+        color: #1D1D1F !important;
+        font-weight: 500 !important;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06) !important;
+    }
+    [data-testid="stButton"] > button:hover {
+        border-color: rgba(0, 0, 0, 0.18) !important;
+        box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1) !important;
+    }
+
+    /* ── Error / info banners ──────────────────────────────────────────── */
+    [data-testid="stAlert"] {
+        border-radius: 12px !important;
+        border: 1px solid rgba(0, 0, 0, 0.06) !important;
     }
 </style>
 """
@@ -140,7 +253,11 @@ def main() -> None:
 
     # ── Sidebar ───────────────────────────────────────────────────
     with st.sidebar:
-        st.markdown("**WeatherEdge**")
+        st.markdown(
+            "<span style='font-size:0.95rem;font-weight:700;color:#1D1D1F;"
+            "letter-spacing:-0.02em'>WeatherEdge</span>",
+            unsafe_allow_html=True,
+        )
         tf = st.selectbox(
             "Timeframe",
             list(TIMEFRAMES.keys()),
@@ -150,7 +267,10 @@ def main() -> None:
         cutoff = _cutoff(tf)
 
         st.divider()
-        if st.checkbox("Confirm reset", key="confirm_reset"):
+        _reset_pw = st.text_input("Reset password", type="password", key="reset_pw",
+                                   label_visibility="collapsed",
+                                   placeholder="Reset password")
+        if _reset_pw == "91Carpentaria":
             if st.button("Reset all data", use_container_width=True):
                 conn = sqlite3.connect(_get_db_path())
                 c = conn.cursor()
@@ -159,6 +279,8 @@ def main() -> None:
                 conn.commit()
                 conn.close()
                 st.rerun()
+        elif _reset_pw:
+            st.caption("Incorrect password.")
 
         st.divider()
         _REFRESH_OPTIONS = {"Off": 0, "30s": 30, "1 min": 60, "5 min": 300}
@@ -344,7 +466,7 @@ def main() -> None:
                 s.created_at as opened,
                 m.station_id as station,
                 m.metric,
-                m.question,
+                m.question as market,
                 s.bin_index,
                 m.outcomes,
                 ROUND(s.model_prob * 100, 1) as model_pct,
@@ -373,7 +495,7 @@ def main() -> None:
             active_df["bet_outcome"] = active_df.apply(
                 lambda r: _bin_label(r["outcomes"], r["bin_index"]), axis=1
             )
-            display_cols = ["opened", "station", "metric", "question", "bet_outcome",
+            display_cols = ["opened", "station", "metric", "market", "bet_outcome",
                             "model_pct", "mkt_pct", "edge_pct", "kelly_pct", "bet_usd", "end_date"]
             display_active = active_df[[c for c in display_cols if c in active_df.columns]]
             total_exposure = active_df["bet_usd"].sum()
@@ -544,7 +666,7 @@ def main() -> None:
                 r.resolved_at as resolved,
                 m.station_id as station,
                 m.metric,
-                m.question,
+                m.question as market,
                 s.bin_index,
                 m.outcomes,
                 ROUND(s.model_prob * 100, 1) as model_pct,
@@ -567,7 +689,7 @@ def main() -> None:
             recent_df["bet_outcome"] = recent_df.apply(
                 lambda r: _bin_label(r["outcomes"], r["bin_index"]), axis=1
             )
-            display_cols = ["resolved", "station", "metric", "question", "bet_outcome",
+            display_cols = ["resolved", "station", "metric", "market", "bet_outcome",
                             "model_pct", "mkt_pct", "edge_pct", "bet_usd", "won", "pnl_usd", "slip_pct"]
             st.dataframe(
                 recent_df[[c for c in display_cols if c in recent_df.columns]],
