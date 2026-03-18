@@ -31,6 +31,8 @@ TIMEFRAMES = {
     "All Time": None,
 }
 
+_REFRESH_OPTIONS = {"Off": 0, "30s": 30, "1 min": 60, "5 min": 300}
+
 
 def _get_db_path() -> str:
     raw = DATABASE_URL
@@ -79,51 +81,92 @@ def _bin_label(outcomes_json, bin_index) -> str:
 
 _CSS = """
 <style>
-    /* ── Base ──────────────────────────────────────────────────────────── */
-    * {
+    /* ── Base font (avoid overriding icon fonts) ────────────────────────── */
+    html, body, .stApp, .stMarkdown, p, li, label, button,
+    [data-testid], [class^="st"] {
         font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display",
-                     "SF Pro Text", "Helvetica Neue", Arial, sans-serif !important;
+                     "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
     }
-    .stApp { background: #F5F5F7; }
+    /* Restore Material Symbols (broken by broad font rules) */
+    .material-symbols-rounded,
+    .material-symbols-outlined,
+    .material-icons {
+        font-family: 'Material Symbols Rounded', 'Material Symbols Outlined',
+                     'Material Icons' !important;
+    }
 
+    /* ── Page ──────────────────────────────────────────────────────────── */
+    .stApp { background: #F5F5F7; }
     .main .block-container {
-        padding-top: 2.25rem;
+        padding-top: 2rem;
         padding-bottom: 3rem;
     }
 
-    /* ── Sidebar ───────────────────────────────────────────────────────── */
+    /* ── Sidebar (admin only) ──────────────────────────────────────────── */
     section[data-testid="stSidebar"] {
-        background: rgba(255, 255, 255, 0.92);
+        background: rgba(255, 255, 255, 0.96);
         border-right: 1px solid rgba(0, 0, 0, 0.07);
     }
 
-    /* ── Metric cards ──────────────────────────────────────────────────── */
+    /* ── KPI cards ─────────────────────────────────────────────────────── */
+    .kpi-card {
+        background: #FFFFFF;
+        border: 1px solid rgba(0, 0, 0, 0.06);
+        border-radius: 16px;
+        padding: 18px 20px 20px;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+        min-height: 96px;
+    }
+    .kpi-label {
+        color: #86868B;
+        font-size: 0.67rem;
+        text-transform: uppercase;
+        letter-spacing: 0.09em;
+        font-weight: 600;
+        margin-bottom: 8px;
+    }
+    .kpi-value {
+        font-weight: 600;
+        font-size: 1.5rem;
+        letter-spacing: -0.02em;
+        color: #1D1D1F;
+        line-height: 1.1;
+    }
+    .kpi-sub {
+        font-size: 0.68rem;
+        color: #86868B;
+        margin-top: 5px;
+        font-weight: 500;
+        letter-spacing: 0.01em;
+    }
+
+    /* ── Streamlit native metrics (fallback) ───────────────────────────── */
     [data-testid="stMetric"] {
         background: #FFFFFF;
         border: 1px solid rgba(0, 0, 0, 0.06);
         border-radius: 16px;
-        padding: 20px 22px;
+        padding: 18px 20px;
         box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04);
+        min-height: 96px;
     }
     [data-testid="stMetricLabel"] {
         color: #86868B;
-        font-size: 0.68rem;
+        font-size: 0.67rem;
         text-transform: uppercase;
         letter-spacing: 0.09em;
         font-weight: 600;
     }
     [data-testid="stMetricValue"] {
         font-weight: 600;
-        font-size: 1.55rem;
+        font-size: 1.5rem;
         color: #1D1D1F;
         letter-spacing: -0.02em;
     }
     [data-testid="stMetricDelta"] svg { display: none; }
     [data-testid="stMetricDelta"] > div {
         color: #86868B !important;
-        font-size: 0.72rem;
+        font-size: 0.68rem;
         font-weight: 500;
-        letter-spacing: 0.01em;
     }
 
     /* ── Typography ────────────────────────────────────────────────────── */
@@ -132,25 +175,69 @@ _CSS = """
         font-weight: 700 !important;
         font-size: 1.75rem !important;
         letter-spacing: -0.03em !important;
+        margin-bottom: 0 !important;
     }
     h2 {
         color: #1D1D1F !important;
         font-weight: 600 !important;
+        font-size: 1.1rem !important;
         letter-spacing: -0.02em !important;
+        margin-top: 0.25rem !important;
+        margin-bottom: 0.75rem !important;
     }
     h3 {
         color: #1D1D1F !important;
         font-weight: 600 !important;
-        font-size: 0.95rem !important;
-        letter-spacing: -0.01em !important;
-        margin-bottom: 0.4rem !important;
+        font-size: 0.88rem !important;
+        letter-spacing: 0.04em !important;
+        text-transform: uppercase !important;
+        color: #86868B !important;
+        margin-bottom: 0.5rem !important;
+    }
+
+    /* ── Section header with accent bar ────────────────────────────────── */
+    .section-heading {
+        font-size: 1.05rem;
+        font-weight: 600;
+        color: #1D1D1F;
+        letter-spacing: -0.02em;
+        padding-left: 12px;
+        border-left: 3px solid #007AFF;
+        margin: 0 0 1rem 0;
+        line-height: 1.3;
+    }
+    .section-caption {
+        font-size: 0.78rem;
+        color: #86868B;
+        margin-top: -0.75rem;
+        margin-bottom: 1rem;
+        padding-left: 15px;
+    }
+
+    /* ── Page header bar ───────────────────────────────────────────────── */
+    .page-header {
+        display: flex;
+        align-items: baseline;
+        gap: 12px;
+        margin-bottom: 0.25rem;
+    }
+    .page-title {
+        font-size: 1.75rem;
+        font-weight: 700;
+        color: #1D1D1F;
+        letter-spacing: -0.03em;
+    }
+    .page-meta {
+        font-size: 0.78rem;
+        color: #86868B;
+        font-weight: 400;
     }
 
     /* ── Dividers ──────────────────────────────────────────────────────── */
     hr {
         border: none !important;
         border-top: 1px solid rgba(0, 0, 0, 0.07) !important;
-        margin: 1.4rem 0 !important;
+        margin: 1.5rem 0 !important;
     }
 
     /* ── Captions ──────────────────────────────────────────────────────── */
@@ -173,12 +260,12 @@ _CSS = """
     [data-testid="stVegaLiteChart"] {
         background: #FFFFFF;
         border-radius: 14px;
-        padding: 6px 8px;
+        padding: 8px 10px;
         border: 1px solid rgba(0, 0, 0, 0.06);
         box-shadow: 0 1px 4px rgba(0, 0, 0, 0.05);
     }
 
-    /* ── Tabs — segmented-control style ───────────────────────────────── */
+    /* ── Tabs — iOS segmented control ──────────────────────────────────── */
     .stTabs [data-baseweb="tab-list"] {
         gap: 0;
         background: rgba(0, 0, 0, 0.05);
@@ -201,8 +288,15 @@ _CSS = """
         box-shadow: 0 1px 4px rgba(0, 0, 0, 0.14), 0 1px 2px rgba(0, 0, 0, 0.08) !important;
     }
 
-    /* ── Selectbox / inputs ────────────────────────────────────────────── */
+    /* ── Selectbox ─────────────────────────────────────────────────────── */
     [data-testid="stSelectbox"] > div > div {
+        border-radius: 8px !important;
+        border-color: rgba(0, 0, 0, 0.1) !important;
+        background: #FFFFFF !important;
+    }
+
+    /* ── Text inputs ───────────────────────────────────────────────────── */
+    [data-testid="stTextInput"] > div > div {
         border-radius: 8px !important;
         border-color: rgba(0, 0, 0, 0.1) !important;
         background: #FFFFFF !important;
@@ -222,13 +316,66 @@ _CSS = """
         box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1) !important;
     }
 
-    /* ── Error / info banners ──────────────────────────────────────────── */
+    /* ── Alert banners ─────────────────────────────────────────────────── */
     [data-testid="stAlert"] {
         border-radius: 12px !important;
         border: 1px solid rgba(0, 0, 0, 0.06) !important;
     }
+
+    /* ── Empty-state text ──────────────────────────────────────────────── */
+    .empty-state {
+        text-align: center;
+        padding: 3rem 0;
+        color: #86868B;
+        font-size: 0.9rem;
+    }
 </style>
 """
+
+# Apple system accent colours
+_GREEN = "#34C759"
+_RED   = "#FF3B30"
+_BLUE  = "#007AFF"
+
+
+def _kpi(col, label: str, value: str, color: str = "#1D1D1F", sub: str = "") -> None:
+    """Render a KPI card with a custom value colour."""
+    sub_html = f'<div class="kpi-sub">{sub}</div>' if sub else ""
+    col.markdown(
+        f'<div class="kpi-card">'
+        f'<div class="kpi-label">{label}</div>'
+        f'<div class="kpi-value" style="color:{color}">{value}</div>'
+        f'{sub_html}'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _section(container, title: str, caption: str = "") -> None:
+    """Render a section heading with blue left-accent bar."""
+    cap_html = f'<div class="section-caption">{caption}</div>' if caption else ""
+    container.markdown(
+        f'<div class="section-heading">{title}</div>{cap_html}',
+        unsafe_allow_html=True,
+    )
+
+
+_POSITION_COL_CONFIG = {
+    "model_pct": st.column_config.NumberColumn("Model %", format="%.1f%%"),
+    "mkt_pct":   st.column_config.NumberColumn("Mkt %",   format="%.1f%%"),
+    "edge_pct":  st.column_config.NumberColumn("Edge %",  format="%.1f%%"),
+    "kelly_pct": st.column_config.NumberColumn("Kelly %", format="%.2f%%"),
+    "bet_usd":   st.column_config.NumberColumn("Bet ($)",  format="$%.2f"),
+}
+
+_TRADES_COL_CONFIG = {
+    "model_pct": st.column_config.NumberColumn("Model %", format="%.1f%%"),
+    "mkt_pct":   st.column_config.NumberColumn("Mkt %",   format="%.1f%%"),
+    "edge_pct":  st.column_config.NumberColumn("Edge %",  format="%.1f%%"),
+    "bet_usd":   st.column_config.NumberColumn("Bet ($)",  format="$%.2f"),
+    "pnl_usd":   st.column_config.NumberColumn("P&L ($)",  format="$%.2f"),
+    "slip_pct":  st.column_config.NumberColumn("Slip %",   format="%.3f%%"),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -251,25 +398,18 @@ def main() -> None:
         )
         return
 
-    # ── Sidebar ───────────────────────────────────────────────────
+    # ── Sidebar (admin) ───────────────────────────────────────────
     with st.sidebar:
         st.markdown(
-            "<span style='font-size:0.95rem;font-weight:700;color:#1D1D1F;"
-            "letter-spacing:-0.02em'>WeatherEdge</span>",
+            "<div style='font-size:0.8rem;font-weight:600;color:#86868B;"
+            "text-transform:uppercase;letter-spacing:0.08em;margin-bottom:12px'>"
+            "Admin</div>",
             unsafe_allow_html=True,
         )
-        tf = st.selectbox(
-            "Timeframe",
-            list(TIMEFRAMES.keys()),
-            index=0,
-            label_visibility="collapsed",
+        _reset_pw = st.text_input(
+            "Reset password", type="password", key="reset_pw",
+            label_visibility="collapsed", placeholder="Reset password",
         )
-        cutoff = _cutoff(tf)
-
-        st.divider()
-        _reset_pw = st.text_input("Reset password", type="password", key="reset_pw",
-                                   label_visibility="collapsed",
-                                   placeholder="Reset password")
         if _reset_pw == "91Carpentaria":
             if st.button("Reset all data", use_container_width=True):
                 conn = sqlite3.connect(_get_db_path())
@@ -282,20 +422,49 @@ def main() -> None:
         elif _reset_pw:
             st.caption("Incorrect password.")
 
-        st.divider()
-        _REFRESH_OPTIONS = {"Off": 0, "30s": 30, "1 min": 60, "5 min": 300}
+    # ── Page header with controls ──────────────────────────────────
+    hdr, ctrl_tf, ctrl_refresh = st.columns([5, 1, 1])
+
+    with ctrl_tf:
+        st.markdown(
+            "<div style='font-size:0.67rem;font-weight:600;color:#86868B;"
+            "text-transform:uppercase;letter-spacing:0.09em;margin-bottom:4px'>"
+            "Timeframe</div>",
+            unsafe_allow_html=True,
+        )
+        tf = st.selectbox(
+            "Timeframe", list(TIMEFRAMES.keys()), index=0,
+            label_visibility="collapsed",
+        )
+        cutoff = _cutoff(tf)
+
+    with ctrl_refresh:
+        st.markdown(
+            "<div style='font-size:0.67rem;font-weight:600;color:#86868B;"
+            "text-transform:uppercase;letter-spacing:0.09em;margin-bottom:4px'>"
+            "Auto-refresh</div>",
+            unsafe_allow_html=True,
+        )
         _refresh_label = st.selectbox(
-            "Auto-refresh",
-            list(_REFRESH_OPTIONS.keys()),
-            index=1,
+            "Auto-refresh", list(_REFRESH_OPTIONS.keys()), index=1,
+            label_visibility="collapsed",
         )
         refresh_interval = _REFRESH_OPTIONS[_refresh_label]
-        st.caption(f"DB: `{Path(db_path).name}`")
 
-    # ── Header ────────────────────────────────────────────────────
-    st.markdown("# WeatherEdge")
-    _refresh_note = f"· refreshes every {_refresh_label}" if refresh_interval else "· auto-refresh off"
-    st.caption(f"{tf}  ·  {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}  {_refresh_note}")
+    with hdr:
+        _refresh_note = (
+            f"refreshes every {_refresh_label}" if refresh_interval else "auto-refresh off"
+        )
+        st.markdown(
+            f'<div class="page-header">'
+            f'<span class="page-title">WeatherEdge</span>'
+            f'<span class="page-meta">'
+            f'{datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")}  ·  {_refresh_note}'
+            f'</span></div>',
+            unsafe_allow_html=True,
+        )
+
+    st.divider()
 
     # ── Load core trade data ───────────────────────────────────────
     trades_raw = _query("""
@@ -388,74 +557,94 @@ def main() -> None:
     )
 
     # ── Tabs ──────────────────────────────────────────────────────
-    tab_overview, tab_positions, tab_analysis, tab_trades = st.tabs([
-        "Overview", "Open Positions", "Analysis", "Trades & Scores",
+    tab_overview, tab_positions, tab_analysis, tab_history = st.tabs([
+        "Overview", "Open Positions", "Analysis", "History",
     ])
 
     # =================================================================
     # TAB 1 — OVERVIEW
     # =================================================================
     with tab_overview:
-        # Row 1: P&L + win stats
+        # ── KPI grid (two rows, no divider between them) ──────────
         c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric("Total P&L", f"${total_pnl:,.2f}")
-        c2.metric(
-            "Win Rate",
-            f"{win_rate:.1%}" if n else "—",
-            delta=f"CI [{win_ci[0]:.0%}–{win_ci[1]:.0%}]" if n >= 5 else None,
-            delta_color="off",
-        )
-        c3.metric("Trades", str(n))
-        c4.metric("Wins / Losses", f"{wins} / {losses}" if n else "—")
-        c5.metric("Avg Win", f"${avg_win:,.2f}" if wins else "—")
-        c6.metric("Avg Loss", f"${avg_loss:,.2f}" if losses else "—")
+        _kpi(c1, "Total P&L",
+             f"${total_pnl:,.2f}" if n else "—",
+             color=_GREEN if total_pnl > 0 else _RED if total_pnl < 0 else "#1D1D1F")
+        _kpi(c2, "Win Rate",
+             f"{win_rate:.1%}" if n else "—",
+             color=_BLUE,
+             sub=f"CI {win_ci[0]:.0%}–{win_ci[1]:.0%}" if n >= 5 else "")
+        _kpi(c3, "Trades", str(n) if n else "—")
+        _kpi(c4, "Wins / Losses",
+             f"{wins} / {losses}" if n else "—",
+             color=_GREEN if wins > losses else _RED if losses > wins else "#1D1D1F")
+        _kpi(c5, "Avg Win",  f"${avg_win:,.2f}"  if wins   else "—", color=_GREEN if wins   else "#1D1D1F")
+        _kpi(c6, "Avg Loss", f"${avg_loss:,.2f}" if losses else "—", color=_RED   if losses else "#1D1D1F")
 
-        st.divider()
+        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 
-        # Row 2: Risk + quality
         c7, c8, c9, c10, c11, c12 = st.columns(6)
-        c7.metric(
-            "Profit Factor",
-            f"{profit_factor:.2f}" if profit_factor != float("inf") else "∞" if n else "—",
-        )
-        c8.metric("Expectancy / Trade", f"${expectancy:,.2f}" if n else "—")
-        c9.metric("Sharpe (ann.)", f"{sharpe:.2f}" if n > 1 else "—")
-        c10.metric("Max Drawdown", f"{mdd:.1%}" if n > 1 else "—")
-        c11.metric("Avg Edge", f"{avg_edge:.1%}" if n else "—")
-        c12.metric("Brier Skill", f"{bss:+.1%}" if bss is not None else "—")
+        _pf_val = f"{profit_factor:.2f}" if profit_factor != float("inf") else "∞" if n else "—"
+        _kpi(c7, "Profit Factor", _pf_val,
+             color=_GREEN if n and profit_factor > 1 else _RED if n and profit_factor <= 1 else "#1D1D1F")
+        _kpi(c8, "Expectancy",
+             f"${expectancy:,.2f}" if n else "—",
+             color=_GREEN if expectancy > 0 else _RED if expectancy < 0 else "#1D1D1F")
+        _kpi(c9, "Sharpe (ann.)",
+             f"{sharpe:.2f}" if n > 1 else "—",
+             color=_BLUE if sharpe > 0 else _RED if sharpe < 0 else "#1D1D1F")
+        _kpi(c10, "Max Drawdown",
+             f"{mdd:.1%}" if n > 1 else "—",
+             color=_RED if mdd < -0.05 else "#1D1D1F")
+        _kpi(c11, "Avg Edge",
+             f"{avg_edge:.1%}" if n else "—",
+             color=_BLUE if n else "#1D1D1F")
+        _bss_color = _GREEN if (bss or 0) > 0 else _RED if (bss or 0) < 0 else "#1D1D1F"
+        _kpi(c12, "Brier Skill",
+             f"{bss:+.1%}" if bss is not None else "—",
+             color=_bss_color)
 
         st.divider()
 
-        # Equity + drawdown side-by-side
+        # ── Charts ────────────────────────────────────────────────
         if len(equity_df) > 1:
             equity_df["resolved_at"] = pd.to_datetime(equity_df["resolved_at"], format="ISO8601")
             equity_idx = equity_df.set_index("resolved_at")
 
             col_eq, col_dd = st.columns(2)
+
             with col_eq:
-                st.markdown("### Equity Curve")
-                st.line_chart(equity_idx["cumulative_pnl"], use_container_width=True)
+                _section(st, "Equity Curve")
+                st.line_chart(
+                    equity_idx[["cumulative_pnl"]].rename(columns={"cumulative_pnl": "P&L ($)"}),
+                    use_container_width=True,
+                    color=_GREEN,
+                )
 
             with col_dd:
-                st.markdown("### Drawdown")
+                _section(st, "Drawdown")
                 cum = equity_idx["cumulative_pnl"].values.astype(float)
                 peak = np.maximum.accumulate(cum)
                 dd_pct = np.where(peak > 0, (cum - peak) / peak * 100, 0.0)
-                dd_df = pd.DataFrame({"drawdown_%": dd_pct}, index=equity_idx.index)
-                st.line_chart(dd_df, use_container_width=True)
-        else:
-            st.caption("Not enough resolved trades for charts yet.")
+                dd_df = pd.DataFrame({"Drawdown (%)": dd_pct}, index=equity_idx.index)
+                st.line_chart(dd_df, use_container_width=True, color=_RED)
 
-        # Rolling win rate
-        if n >= 10:
-            st.divider()
-            st.markdown("### Rolling Win Rate (30-trade window)")
-            rolling = trades_raw.copy()
-            rolling["resolved_at"] = pd.to_datetime(rolling["resolved_at"], format="ISO8601")
-            rolling = rolling.sort_values("resolved_at")
-            rolling["rolling_wr"] = rolling["won"].rolling(30, min_periods=5).mean()
-            rolling = rolling.set_index("resolved_at").dropna(subset=["rolling_wr"])
-            st.line_chart(rolling["rolling_wr"], use_container_width=True)
+            # Rolling win rate
+            if n >= 10:
+                st.divider()
+                _section(st, "Rolling Win Rate",
+                         "30-trade rolling window — shows consistency of edge over time")
+                rolling = trades_raw.copy()
+                rolling["resolved_at"] = pd.to_datetime(rolling["resolved_at"], format="ISO8601")
+                rolling = rolling.sort_values("resolved_at")
+                rolling["Win Rate (%)"] = rolling["won"].rolling(30, min_periods=5).mean() * 100
+                rolling = rolling.set_index("resolved_at").dropna(subset=["Win Rate (%)"])
+                st.line_chart(rolling["Win Rate (%)"], use_container_width=True, color=_BLUE)
+        else:
+            st.markdown(
+                '<div class="empty-state">Not enough resolved trades for charts yet.</div>',
+                unsafe_allow_html=True,
+            )
 
     # =================================================================
     # TAB 2 — OPEN POSITIONS
@@ -495,28 +684,42 @@ def main() -> None:
             active_df["bet_outcome"] = active_df.apply(
                 lambda r: _bin_label(r["outcomes"], r["bin_index"]), axis=1
             )
-            display_cols = ["opened", "station", "metric", "market", "bet_outcome",
-                            "model_pct", "mkt_pct", "edge_pct", "kelly_pct", "bet_usd", "end_date"]
-            display_active = active_df[[c for c in display_cols if c in active_df.columns]]
             total_exposure = active_df["bet_usd"].sum()
             avg_pos_edge = active_df["edge_pct"].mean()
-            p1, p2, p3 = st.columns(3)
-            p1.metric("Open Positions", str(len(active_df)))
-            p2.metric("Total Exposure", f"${total_exposure:,.2f}")
-            p3.metric("Avg Edge", f"{avg_pos_edge:.1f}%")
-            st.dataframe(display_active, use_container_width=True, hide_index=True)
+
+            p1, p2, p3, *_ = st.columns(6)
+            _kpi(p1, "Open Positions", str(len(active_df)), color=_BLUE)
+            _kpi(p2, "Total Exposure", f"${total_exposure:,.2f}")
+            _kpi(p3, "Avg Edge", f"{avg_pos_edge:.1f}%", color=_BLUE)
+
+            st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+
+            display_cols = ["opened", "station", "metric", "market", "bet_outcome",
+                            "model_pct", "mkt_pct", "edge_pct", "kelly_pct", "bet_usd", "end_date"]
+            st.dataframe(
+                active_df[[c for c in display_cols if c in active_df.columns]],
+                use_container_width=True,
+                hide_index=True,
+                column_config=_POSITION_COL_CONFIG,
+            )
         else:
-            st.caption("No open positions.")
+            st.markdown(
+                '<div class="empty-state">No open positions.</div>',
+                unsafe_allow_html=True,
+            )
 
     # =================================================================
     # TAB 3 — ANALYSIS
     # =================================================================
     with tab_analysis:
         if n == 0:
-            st.caption("No resolved trades in this window — nothing to analyse.")
+            st.markdown(
+                '<div class="empty-state">No resolved trades in this window.</div>',
+                unsafe_allow_html=True,
+            )
         else:
-            # Station breakdown
-            st.markdown("### Performance by Station")
+            # ── Station breakdown ──────────────────────────────────
+            _section(st, "Performance by Station")
             station_df = _query("""
                 SELECT
                     m.station_id,
@@ -545,8 +748,8 @@ def main() -> None:
 
             st.divider()
 
-            # Metric breakdown
-            st.markdown("### Performance by Weather Metric")
+            # ── Metric breakdown ───────────────────────────────────
+            _section(st, "Performance by Weather Metric")
             metric_df = _query("""
                 SELECT
                     m.metric,
@@ -574,10 +777,9 @@ def main() -> None:
 
             st.divider()
 
-            # Calibration
-            st.markdown("### Model Calibration")
-            st.caption("Predicted probability vs actual win rate — a well-calibrated model sits on the diagonal.")
-
+            # ── Calibration ────────────────────────────────────────
+            _section(st, "Model Calibration",
+                     "Predicted probability vs actual win rate — a well-calibrated model sits on the diagonal.")
             calib_raw = _query("""
                 SELECT s.model_prob, r.won
                 FROM results r
@@ -598,7 +800,7 @@ def main() -> None:
                         calib_raw["model_prob"].tolist(),
                         calib_raw["won"].astype(int).tolist(),
                     )
-                    st.caption(f"Expected Calibration Error (ECE): {ece:.3f}  ·  lower = better")
+                    st.caption(f"Expected Calibration Error (ECE): {ece:.3f}  ·  lower is better")
                     calib_chart = pd.DataFrame({
                         "model": [d["predicted_mean"] for d in diagram],
                         "actual": [d["actual_frequency"] for d in diagram],
@@ -610,36 +812,37 @@ def main() -> None:
 
             st.divider()
 
-            # Distributions
-            st.markdown("### Signal Distributions")
+            # ── Signal distributions ───────────────────────────────
+            _section(st, "Signal Distributions")
             col_d1, col_d2 = st.columns(2)
 
             with col_d1:
-                st.caption("Bet size distribution ($)")
+                st.caption("Bet size ($)")
                 bet_vals = trades_raw["bet_size_usd"].dropna().values
                 if len(bet_vals):
                     counts, bins = np.histogram(bet_vals, bins=10)
-                    hist_df = pd.DataFrame({
-                        "bet_$": [f"${b:.0f}" for b in bins[:-1]],
-                        "count": counts,
-                    }).set_index("bet_$")
-                    st.bar_chart(hist_df, use_container_width=True)
+                    st.bar_chart(
+                        pd.DataFrame({"count": counts},
+                                     index=[f"${b:.0f}" for b in bins[:-1]]),
+                        use_container_width=True,
+                    )
 
             with col_d2:
-                st.caption("Edge distribution (%)")
+                st.caption("Edge (%)")
                 edge_vals = (trades_raw["edge"].dropna() * 100).values
                 if len(edge_vals):
                     counts, bins = np.histogram(edge_vals, bins=10)
-                    hist_df = pd.DataFrame({
-                        "edge_%": [f"{b:.1f}%" for b in bins[:-1]],
-                        "count": counts,
-                    }).set_index("edge_%")
-                    st.bar_chart(hist_df, use_container_width=True)
+                    st.bar_chart(
+                        pd.DataFrame({"count": counts},
+                                     index=[f"{b:.1f}%" for b in bins[:-1]]),
+                        use_container_width=True,
+                    )
 
-            # Edge vs outcome scatter summary
             st.divider()
-            st.markdown("### Edge Buckets — Predicted vs Actual")
-            st.caption("Does higher edge correlate with better outcomes?")
+
+            # ── Edge buckets ───────────────────────────────────────
+            _section(st, "Edge Buckets — Predicted vs Actual",
+                     "Does higher edge correlate with better outcomes?")
             if n >= 10:
                 bucket_df = trades_raw.copy()
                 bucket_df["edge_bucket"] = pd.cut(
@@ -657,10 +860,10 @@ def main() -> None:
                 st.dataframe(summary, use_container_width=True, hide_index=True)
 
     # =================================================================
-    # TAB 4 — TRADES & SCORES
+    # TAB 4 — HISTORY
     # =================================================================
-    with tab_trades:
-        st.markdown("### Recent Trades")
+    with tab_history:
+        _section(st, "Recent Trades")
         recent_df = _query("""
             SELECT
                 r.resolved_at as resolved,
@@ -693,13 +896,18 @@ def main() -> None:
                             "model_pct", "mkt_pct", "edge_pct", "bet_usd", "won", "pnl_usd", "slip_pct"]
             st.dataframe(
                 recent_df[[c for c in display_cols if c in recent_df.columns]],
-                use_container_width=True, hide_index=True
+                use_container_width=True,
+                hide_index=True,
+                column_config=_TRADES_COL_CONFIG,
             )
         else:
-            st.caption("No resolved trades in this window.")
+            st.markdown(
+                '<div class="empty-state">No resolved trades in this window.</div>',
+                unsafe_allow_html=True,
+            )
 
         st.divider()
-        st.markdown("### Brier Scores by Market")
+        _section(st, "Brier Scores by Market")
         brier_detail = _query("""
             SELECT
                 bs.market_id,
@@ -720,9 +928,12 @@ def main() -> None:
         if len(brier_detail):
             st.dataframe(brier_detail, use_container_width=True, hide_index=True)
         else:
-            st.caption("No Brier scores in this window.")
+            st.markdown(
+                '<div class="empty-state">No Brier scores in this window.</div>',
+                unsafe_allow_html=True,
+            )
 
-    # ── Auto-refresh (preserves tab state via st.rerun, not browser reload) ──
+    # ── Auto-refresh ───────────────────────────────────────────────
     if refresh_interval:
         try:
             from streamlit_autorefresh import st_autorefresh
