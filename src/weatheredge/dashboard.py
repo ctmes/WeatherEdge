@@ -8,7 +8,6 @@ Launch:
 from __future__ import annotations
 
 import sqlite3
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -307,8 +306,10 @@ def main() -> None:
 
     # ── Auto-refresh ──────────────────────────────────────────────
     if refresh_interval:
-        time.sleep(refresh_interval)
-        st.rerun()
+        st.markdown(
+            f'<meta http-equiv="refresh" content="{refresh_interval}">',
+            unsafe_allow_html=True,
+        )
 
 
 # ---------------------------------------------------------------------------
