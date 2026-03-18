@@ -526,7 +526,9 @@ def main() -> None:
         avg_edge = float(trades_raw["edge"].mean())
         win_ci = analytics.win_rate_confidence_interval(wins, n)
         total_bet_usd = float(trades_raw["bet_size_usd"].sum())
-        total_ev_usd = float((trades_raw["edge"] * trades_raw["bet_size_usd"]).sum())
+        total_ev_usd = float(
+            ((trades_raw["model_prob"] / trades_raw["market_prob"] - 1.0) * trades_raw["bet_size_usd"]).sum()
+        )
         wtd_avg_edge = total_ev_usd / total_bet_usd if total_bet_usd > 0 else 0.0
     else:
         wins = losses = 0
@@ -714,7 +716,7 @@ def main() -> None:
                 ROUND(s.edge * 100, 1) as edge_pct,
                 ROUND(s.kelly_fraction * 100, 2) as kelly_pct,
                 ROUND(s.bet_size_usd, 2) as bet_usd,
-                ROUND(s.edge * s.bet_size_usd, 2) as wtd_ev_usd,
+                ROUND((s.model_prob / s.market_prob - 1.0) * s.bet_size_usd, 2) as wtd_ev_usd,
                 m.end_date
             FROM signals s
             JOIN markets m ON s.market_id = m.id
