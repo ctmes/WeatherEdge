@@ -6,7 +6,7 @@ score predictions, and write Result + BrierScore rows.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -15,7 +15,7 @@ from sqlalchemy import select, func
 from weatheredge.cache import cache_key as _cache_key, read_cache, write_cache
 from weatheredge.config import POLYMARKET_GAMMA_BASE
 from weatheredge.db import get_session, get_next_market_price
-from weatheredge.models import BrierScore, Market, Result, Signal
+from weatheredge.models import BrierScore, Market, Result, Signal, StationCalibration
 from weatheredge.probability import brier_score
 
 logger = logging.getLogger("weatheredge.resolver")
@@ -68,6 +68,27 @@ async def check_resolutions() -> int:
                     exc_info=True,
                 )
                 continue
+
+            if outcome is None:
+                # Polymarket hasn't closed this market — try observation fallback
+                # for markets whose end_date is more than 48 hours in the past.
+                market_row = await session.get(Market, market_id)
+                if market_row is not None and market_row.end_date is not None:
+                    age = datetime.utcnow() - market_row.end_date
+                    if age > timedelta(hours=48):
+                        try:
+                            outcome = await _fetch_observed_outcome(session, market_row)
+                            if outcome:
+                                logger.info(
+                                    "Resolved market %s via observation fallback (bin %d).",
+                                    market_id, outcome["resolved_bin"],
+                                )
+                        except Exception:
+                            logger.warning(
+                                "Observation fallback failed for market %s.",
+                                market_id,
+                                exc_info=True,
+                            )
 
             if outcome is None:
                 continue
@@ -173,6 +194,83 @@ async def _fetch_resolved_outcome(market_id: str) -> dict[str, Any] | None:
     result = {"resolved_bin": resolved_bin}
     write_cache(_SUBDIR, ck, result)
     return result
+
+
+# =========================================================================
+# Observation-based fallback resolution
+# =========================================================================
+
+async def _fetch_observed_outcome(session, market: Market) -> dict[str, Any] | None:
+    """
+    Resolve a market by fetching the actual weather observation from IEM/ERA5
+    and finding which bin the observed value falls into.
+
+    Used when Polymarket hasn't marked the market as closed after 48h.
+    """
+    from weatheredge.mesonet import fetch_daily_observations
+
+    if not market.station_id or not market.metric or not market.bins or not market.resolution_date:
+        logger.debug("Market %s missing required fields for observation fallback.", market.id)
+        return None
+
+    res_date = market.resolution_date
+    if isinstance(res_date, str):
+        res_date = date.fromisoformat(res_date)
+
+    # Look up lat/lon for ERA5 fallback
+    cal = await session.get(StationCalibration, market.station_id)
+    lat = cal.latitude if cal else None
+    lon = cal.longitude if cal else None
+
+    obs_list = await fetch_daily_observations(
+        market.station_id, res_date, res_date, latitude=lat, longitude=lon
+    )
+
+    if not obs_list:
+        logger.debug("No observation data for %s on %s.", market.station_id, res_date)
+        return None
+
+    obs = obs_list[0]
+    metric = market.metric.lower()
+    if metric in ("tmax", "temperature_max"):
+        observed_val = obs.tmax_c
+    elif metric in ("tmin", "temperature_min"):
+        observed_val = obs.tmin_c
+    elif metric in ("precip", "precipitation"):
+        observed_val = obs.precip_mm
+    else:
+        logger.debug("Unknown metric %r for market %s.", market.metric, market.id)
+        return None
+
+    if observed_val is None:
+        logger.debug("Observation value is None for %s %s on %s.", market.station_id, metric, res_date)
+        return None
+
+    bins = market.bins  # [{low, high}, ...]
+    resolved_bin = None
+    for i, b in enumerate(bins):
+        low = b.get("low")
+        high = b.get("high")
+        # Handle unbounded edges
+        below = (low is None or observed_val >= low)
+        above = (high is None or observed_val < high)
+        if below and above:
+            resolved_bin = i
+            break
+
+    if resolved_bin is None:
+        # Clamp to last bin if value exceeds all ranges
+        resolved_bin = len(bins) - 1
+        logger.debug(
+            "Value %.2f outside all bins for market %s — clamping to bin %d.",
+            observed_val, market.id, resolved_bin,
+        )
+
+    logger.info(
+        "Observation fallback: %s %s=%.2f on %s → bin %d",
+        market.station_id, metric, observed_val, res_date, resolved_bin,
+    )
+    return {"resolved_bin": resolved_bin}
 
 
 # =========================================================================
