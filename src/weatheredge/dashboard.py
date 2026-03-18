@@ -388,8 +388,8 @@ _POSITION_COL_CONFIG = {
     "edge_pct":       st.column_config.NumberColumn("Edge %",       format="%.1f%%"),
     "kelly_pct":      st.column_config.NumberColumn("Kelly %",      format="%.2f%%"),
     "bet_usd":        st.column_config.NumberColumn("Bet ($)",       format="$%.2f"),
-    "wtd_ev_usd":     st.column_config.NumberColumn("EV ($)",        format="$%.2f"),
-    "exp_return_usd": st.column_config.NumberColumn("Exp. Return ($)", format="$%.2f"),
+    "wtd_ev_usd":     st.column_config.NumberColumn("Exp. Profit ($)", format="$%.2f"),
+    "exp_return_usd": st.column_config.NumberColumn("EV ($)",          format="$%.2f"),
 }
 
 _TRADES_COL_CONFIG = {
@@ -642,10 +642,10 @@ def main() -> None:
              color=_BLUE if n else "#1D1D1F",
              sub="size-weighted edge")
         _ev_color = _GREEN if total_ev_usd > 0 else _RED if total_ev_usd < 0 else "#1D1D1F"
-        _kpi(d2, "Total Exp. EV",
+        _kpi(d2, "Total Exp. Profit",
              f"${total_ev_usd:,.2f}" if n else "—",
              color=_ev_color,
-             sub="Σ edge × bet size")
+             sub="Σ (model/price − 1) × bet")
 
         st.divider()
 
@@ -755,11 +755,12 @@ def main() -> None:
             _kpi(p1, "Open Positions", str(len(active_df)), color=_BLUE)
             _kpi(p2, "Total Exposure", f"${total_exposure:,.2f}")
             _kpi(p3, "Avg Edge", f"{avg_pos_edge:.1f}%", color=_BLUE)
-            _ev_col = _GREEN if portfolio_ev > 0 else _RED if portfolio_ev < 0 else "#1D1D1F"
-            _kpi(p4, "Portfolio EV", f"${portfolio_ev:,.2f}", color=_ev_col,
-                 sub="Σ edge × bet size")
-            _kpi(p5, "Exp. Return", f"${total_exp_return:,.2f}", color=_GREEN,
+            _ev_col = _GREEN if total_exp_return > 0 else _RED if total_exp_return < 0 else "#1D1D1F"
+            _kpi(p4, "Portfolio EV", f"${total_exp_return:,.2f}", color=_ev_col,
                  sub="Σ (model/price) × bet")
+            _profit_col = _GREEN if portfolio_ev > 0 else _RED if portfolio_ev < 0 else "#1D1D1F"
+            _kpi(p5, "Exp. Profit", f"${portfolio_ev:,.2f}", color=_profit_col,
+                 sub="EV − exposure")
 
             st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
