@@ -277,7 +277,7 @@ def main() -> None:
     )
 
     if len(equity_df) > 1:
-        equity_df["resolved_at"] = pd.to_datetime(equity_df["resolved_at"])
+        equity_df["resolved_at"] = pd.to_datetime(equity_df["resolved_at"], format="ISO8601")
         st.line_chart(
             equity_df.set_index("resolved_at")["cumulative_pnl"],
             use_container_width=True,
