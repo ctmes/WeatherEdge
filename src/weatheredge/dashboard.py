@@ -241,7 +241,7 @@ def main() -> None:
         LEFT JOIN results r ON r.signal_id = s.id
         WHERE r.id IS NULL
           AND s.signal_type != 'backtest'
-          AND (m.end_date IS NULL OR m.end_date > datetime('now'))
+          AND (m.end_date IS NULL OR m.end_date > datetime('now', '-2 days'))
           AND s.id = (
               SELECT id FROM signals s2
               WHERE s2.market_id = s.market_id
