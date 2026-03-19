@@ -384,6 +384,8 @@ class WeatherEdgeMarketWS:
 
                 while self._running:
                     msg = await self._ws.recv()
+                    if not msg:
+                        continue
                     data = json.loads(msg)
                     await self._handle_message(data)
 
