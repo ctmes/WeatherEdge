@@ -71,11 +71,13 @@ async def check_resolutions() -> int:
 
             if outcome is None:
                 # Polymarket hasn't closed this market — try observation fallback
-                # for markets whose end_date is more than 48 hours in the past.
+                # for markets whose end_date is more than 6 hours in the past.
+                # IEM daily observations are typically finalized within a few hours
+                # of midnight, so 6h is safe without waiting 48h for Polymarket.
                 market_row = await session.get(Market, market_id)
                 if market_row is not None and market_row.end_date is not None:
                     age = datetime.utcnow() - market_row.end_date
-                    if age > timedelta(hours=48):
+                    if age > timedelta(hours=6):
                         try:
                             outcome = await _fetch_observed_outcome(session, market_row)
                             if outcome:
