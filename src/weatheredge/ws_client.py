@@ -387,7 +387,11 @@ class WeatherEdgeMarketWS:
                     msg = await self._ws.recv()
                     if not msg or not msg.strip():
                         continue
-                    data = json.loads(msg)
+                    try:
+                        data = json.loads(msg)
+                    except json.JSONDecodeError:
+                        logger.debug("Skipping non-JSON message: %r", msg)
+                        continue
                     await self._handle_message(data)
 
             # FIX #3: catch ConnectionClosed specifically for clean reconnect
