@@ -101,8 +101,13 @@ async def run_live_paper(
             new_markets = await fetch_weather_markets()
             markets = [m for m in new_markets if m.station_id]
 
+            today = datetime.utcnow().date()
             all_token_ids = []
             for m in markets:
+                # Skip markets whose resolution date is already past — we don't
+                # need live prices for them, only resolution checks.
+                if m.resolution_date and m.resolution_date < today:
+                    continue
                 all_token_ids.extend(m.token_ids)
                 if not m.token_ids:
                     all_token_ids.append(m.condition_id)
