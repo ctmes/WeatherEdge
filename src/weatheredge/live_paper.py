@@ -68,6 +68,7 @@ async def run_live_paper(
     # Used to refuse trading a station when its data is stale.
     forecast_fetched_at: Dict[str, datetime] = {}
     last_market_refresh = datetime.min
+    last_resolution_check = datetime.min
 
     async def refresh_metadata():
         nonlocal markets, forecasts, regime_data, calibrations, last_market_refresh
@@ -233,6 +234,16 @@ async def run_live_paper(
             # All three must be fresh before any trade decision is made.
             if (now - last_market_refresh).total_seconds() > market_refresh_interval:
                 await refresh_metadata()
+
+            if (now - last_resolution_check).total_seconds() > 1800:
+                try:
+                    from weatheredge.resolver import check_resolutions
+                    resolved = await check_resolutions()
+                    if resolved:
+                        logger.info("Resolved %d signal(s).", resolved)
+                except Exception:
+                    logger.exception("Resolution check failed — will retry next cycle.")
+                last_resolution_check = datetime.utcnow()
 
             if not markets:
                 await asyncio.sleep(5)
