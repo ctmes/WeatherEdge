@@ -7,6 +7,7 @@ Launch:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from datetime import datetime, timedelta
@@ -40,6 +41,41 @@ def _get_db_path() -> str:
         if raw.startswith(prefix):
             return raw[len(prefix):]
     return "weatheredge.db"
+
+
+_RESOLVE_INTERVAL_SECS = 1800  # must match live_paper.py
+
+
+def _resolve_state_path() -> Path:
+    return Path(_get_db_path()).parent / ".resolution_state.json"
+
+
+def _read_resolve_state() -> dict:
+    try:
+        return json.loads(_resolve_state_path().read_text())
+    except Exception:
+        return {}
+
+
+def _write_resolve_state(last_run: datetime, resolved_count: int) -> None:
+    try:
+        _resolve_state_path().write_text(
+            json.dumps({"last_run": last_run.isoformat(), "resolved_count": resolved_count})
+        )
+    except Exception:
+        pass
+
+
+def _run_resolution_check() -> int:
+    async def _inner():
+        from weatheredge.resolver import check_resolutions
+        return await check_resolutions()
+
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_inner())
+    finally:
+        loop.close()
 
 
 def _query(sql: str, params: tuple = ()) -> pd.DataFrame:
@@ -693,6 +729,44 @@ def main() -> None:
     # TAB 2 — OPEN POSITIONS
     # =================================================================
     with tab_positions:
+        # ── Resolution check status ────────────────────────────────
+        _rs = _read_resolve_state()
+        _last_run_iso = _rs.get("last_run")
+        _last_resolved = _rs.get("resolved_count", 0)
+
+        if _last_run_iso:
+            _last_run_dt = datetime.fromisoformat(_last_run_iso)
+            _age_secs = (datetime.utcnow() - _last_run_dt).total_seconds()
+            _next_secs = max(0, _RESOLVE_INTERVAL_SECS - _age_secs)
+            _age_str = (
+                f"{int(_age_secs // 60)}m {int(_age_secs % 60)}s ago"
+                if _age_secs < 3600
+                else f"{_age_secs / 3600:.1f}h ago"
+            )
+            _next_str = (
+                f"in {int(_next_secs // 60)}m {int(_next_secs % 60)}s"
+                if _next_secs > 0
+                else "overdue"
+            )
+            _last_run_label = f"Last check: **{_age_str}** · Next: **{_next_str}** · Resolved last run: **{_last_resolved}**"
+        else:
+            _last_run_label = "Resolution check: **never run**"
+
+        _rc1, _rc2 = st.columns([5, 1])
+        _rc1.markdown(_last_run_label)
+        if _rc2.button("Run now", use_container_width=True):
+            with st.spinner("Running resolution check..."):
+                try:
+                    _n = _run_resolution_check()
+                    _now = datetime.utcnow()
+                    _write_resolve_state(_now, _n)
+                    st.success(f"Resolved {_n} signal(s).")
+                    st.rerun()
+                except Exception as _e:
+                    st.error(f"Resolution check failed: {_e}")
+
+        st.divider()
+
         active_df = _query("""
             SELECT
                 s.created_at as opened,

@@ -13,9 +13,11 @@ when a trade fires. The live orderbook price is always fresh (WebSocket, seconds
 """
 
 import asyncio
+import json
 import logging
 import signal as _signal
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Dict, List
 
 from weatheredge.db import init_db, get_session, get_calibrations, warn_stale_calibrations, get_pnl_summary, get_exposure_summary
@@ -24,10 +26,29 @@ from weatheredge.pipeline import fetch_weather_markets, get_station, fetch_forec
 from weatheredge.ws_client import WeatherEdgeMarketWS, OrderbookSnapshot, TradeEvent
 from weatheredge.models import ParsedMarket, ForecastResult
 from weatheredge.execution import execute_signal, load_open_positions, clear_executed_signals
-from weatheredge.config import TRADING
+from weatheredge.config import TRADING, DATABASE_URL
 from weatheredge.safety import CircuitBreaker, check_position_limits
 
 logger = logging.getLogger("weatheredge.live_paper")
+
+_RESOLVE_INTERVAL_SECS = 1800  # 30 minutes
+
+
+def _resolve_state_path() -> Path:
+    raw = DATABASE_URL
+    for prefix in ("sqlite+aiosqlite:///", "sqlite:///"):
+        if raw.startswith(prefix):
+            return Path(raw[len(prefix):]).parent / ".resolution_state.json"
+    return Path("weatheredge.db").parent / ".resolution_state.json"
+
+
+def _write_resolve_state(last_run: datetime, resolved_count: int) -> None:
+    try:
+        _resolve_state_path().write_text(
+            json.dumps({"last_run": last_run.isoformat(), "resolved_count": resolved_count})
+        )
+    except Exception:
+        pass  # non-critical
 
 # Maximum age of per-station forecast data before we refuse to trade that station.
 # A station whose forecast fetch failed silently will have no entry here and be skipped.
@@ -235,15 +256,17 @@ async def run_live_paper(
             if (now - last_market_refresh).total_seconds() > market_refresh_interval:
                 await refresh_metadata()
 
-            if (now - last_resolution_check).total_seconds() > 1800:
+            if (now - last_resolution_check).total_seconds() > _RESOLVE_INTERVAL_SECS:
+                _resolved_count = 0
                 try:
                     from weatheredge.resolver import check_resolutions
-                    resolved = await check_resolutions()
-                    if resolved:
-                        logger.info("Resolved %d signal(s).", resolved)
+                    _resolved_count = await check_resolutions()
+                    if _resolved_count:
+                        logger.info("Resolved %d signal(s).", _resolved_count)
                 except Exception:
                     logger.exception("Resolution check failed — will retry next cycle.")
                 last_resolution_check = datetime.utcnow()
+                _write_resolve_state(last_resolution_check, _resolved_count)
 
             if not markets:
                 await asyncio.sleep(5)
