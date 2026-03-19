@@ -274,7 +274,8 @@ class WeatherEdgeMarketWS:
         if not asset_ids:
             return
         self._subscribed_assets.update(asset_ids)
-        if self._ws:
+        ws = self._ws
+        if ws:
             # Polymarket's WS server closes the connection with 1009 if a
             # response frame exceeds ~1MB. Subscribing to hundreds of assets at
             # once triggers a large snapshot reply, so we chunk the list to
@@ -284,7 +285,7 @@ class WeatherEdgeMarketWS:
             for i in range(0, len(ids), _CHUNK):
                 chunk = ids[i:i + _CHUNK]
                 msg = {"type": "subscribe", "assets_ids": chunk}
-                await self._ws.send(json.dumps(msg))
+                await ws.send(json.dumps(msg))
                 await asyncio.sleep(0.1)  # brief pause between chunks
             logger.info("Subscribed to %d assets", len(asset_ids))
 
@@ -384,7 +385,7 @@ class WeatherEdgeMarketWS:
 
                 while self._running:
                     msg = await self._ws.recv()
-                    if not msg:
+                    if not msg or not msg.strip():
                         continue
                     data = json.loads(msg)
                     await self._handle_message(data)
