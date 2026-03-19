@@ -156,12 +156,20 @@ async def _fetch_resolved_outcome(market_id: str) -> dict[str, Any] | None:
     """
     Check the Polymarket Gamma API for a market's resolution status.
 
+    Group temperature markets are stored with a numeric event ID; individual
+    markets use a hex condition ID.  The /markets/{id} endpoint only handles
+    condition IDs, so we route numeric IDs through /events/{id} instead.
+
     Returns {"resolved_bin": int} if the market is resolved, else None.
     """
     ck = _cache_key("resolved", market_id)
     cached = read_cache(_SUBDIR, ck)  # Permanent cache for resolutions
     if cached is not None:
         return cached
+
+    # Numeric IDs are event/group markets — use the /events endpoint
+    if market_id.isdigit():
+        return await _fetch_resolved_outcome_event(market_id)
 
     url = f"{POLYMARKET_GAMMA_BASE}/markets/{market_id}"
 
@@ -205,6 +213,66 @@ async def _fetch_resolved_outcome(market_id: str) -> dict[str, Any] | None:
     result = {"resolved_bin": resolved_bin}
     write_cache(_SUBDIR, ck, result)
     return result
+
+
+async def _fetch_resolved_outcome_event(market_id: str) -> dict[str, Any] | None:
+    """
+    Resolve a group/event market (numeric ID) via GET /events/{id}.
+
+    The event contains an ordered list of child markets, one per temperature
+    bin.  The resolved child will have outcomePrices close to [1.0, 0.0]
+    (YES resolved).  We match the child's position in the sorted list to the
+    bin index stored in our DB.
+    """
+    import json as _json
+
+    url = f"{POLYMARKET_GAMMA_BASE}/events/{market_id}"
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(url)
+        if resp.status_code == 404:
+            logger.debug("Event %s not found (404).", market_id)
+            return None
+        resp.raise_for_status()
+        data = resp.json()
+
+    if not data.get("closed", False):
+        return None
+
+    markets = data.get("markets", [])
+    if not markets:
+        return None
+
+    # Sort child markets by their threshold value to align with bin order
+    def _threshold(m: dict) -> float:
+        try:
+            return float(m.get("groupItemThreshold", 0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    sorted_markets = sorted(markets, key=_threshold)
+
+    for i, child in enumerate(sorted_markets):
+        prices_raw = child.get("outcomePrices", "")
+        if isinstance(prices_raw, str):
+            try:
+                prices = _json.loads(prices_raw)
+            except (_json.JSONDecodeError, TypeError):
+                continue
+        elif isinstance(prices_raw, list):
+            prices = prices_raw
+        else:
+            continue
+
+        # First outcome is YES — resolved bin has YES price close to 1.0
+        if prices and float(prices[0]) > 0.90:
+            result = {"resolved_bin": i}
+            ck = _cache_key("resolved", market_id)
+            write_cache(_SUBDIR, ck, result)
+            logger.info("Event %s resolved via /events endpoint: bin %d.", market_id, i)
+            return result
+
+    logger.debug("Event %s is closed but no child market resolved clearly.", market_id)
+    return None
 
 
 # =========================================================================
