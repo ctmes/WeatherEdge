@@ -75,8 +75,14 @@ async def check_resolutions() -> int:
                 # IEM daily observations are typically finalized within a few hours
                 # of midnight, so 6h is safe without waiting 48h for Polymarket.
                 market_row = await session.get(Market, market_id)
-                if market_row is not None and market_row.end_date is not None:
-                    age = datetime.utcnow() - market_row.end_date
+                if market_row is not None:
+                    # Use end_date if available, else fall back to resolution_date
+                    cutoff_dt = market_row.end_date
+                    if cutoff_dt is None and market_row.resolution_date is not None:
+                        res = market_row.resolution_date
+                        cutoff_dt = datetime(res.year, res.month, res.day, 23, 59, 59)
+                if market_row is not None and cutoff_dt is not None:
+                    age = datetime.utcnow() - cutoff_dt
                     if age > timedelta(hours=6):
                         try:
                             outcome = await _fetch_observed_outcome(session, market_row)
