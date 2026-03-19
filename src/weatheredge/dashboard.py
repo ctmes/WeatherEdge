@@ -117,18 +117,21 @@ def _bin_label(outcomes_json, bin_index) -> str:
 
 _CSS = """
 <style>
-    /* ── Base font (avoid overriding icon fonts) ────────────────────────── */
+    /* ── Base font ──────────────────────────────────────────────────────── */
     html, body, .stApp, .stMarkdown, p, li, label, button,
     [data-testid], [class^="st"] {
         font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display",
                      "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
     }
-    /* Restore Material Symbols (broken by broad font rules) */
-    .material-symbols-rounded,
-    .material-symbols-outlined,
+    /* Restore icon fonts broken by the broad rule above */
+    .material-symbols-rounded {
+        font-family: 'Material Symbols Rounded' !important;
+    }
+    .material-symbols-outlined {
+        font-family: 'Material Symbols Outlined' !important;
+    }
     .material-icons {
-        font-family: 'Material Symbols Rounded', 'Material Symbols Outlined',
-                     'Material Icons' !important;
+        font-family: 'Material Icons' !important;
     }
 
     /* ── Page ──────────────────────────────────────────────────────────── */
