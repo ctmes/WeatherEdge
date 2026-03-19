@@ -622,8 +622,8 @@ def main() -> None:
     )
 
     # ── Tabs ──────────────────────────────────────────────────────
-    tab_overview, tab_positions, tab_analysis, tab_history = st.tabs([
-        "Overview", "Open Positions", "Analysis", "History",
+    tab_overview, tab_positions, tab_analysis, tab_history, tab_guide = st.tabs([
+        "Overview", "Open Positions", "Analysis", "History", "Guide",
     ])
 
     # =================================================================
@@ -1076,6 +1076,140 @@ def main() -> None:
                 '<div class="empty-state">No Brier scores in this window.</div>',
                 unsafe_allow_html=True,
             )
+
+    # =================================================================
+    # TAB 5 — GUIDE
+    # =================================================================
+    with tab_guide:
+        st.markdown("## WeatherEdge — Quick Guide")
+        st.markdown("*A plain-English overview of what this dashboard shows and how the system works.*")
+        st.divider()
+
+        with st.expander("**What is WeatherEdge?**", expanded=True):
+            st.markdown("""
+WeatherEdge is an automated system that places **paper trades** (simulated bets with no real money) on
+weather prediction markets hosted on [Polymarket](https://polymarket.com).
+
+The idea is simple: professional weather forecast models are often more accurate than the prices implied
+by casual bettors on those markets. When the models and the market disagree significantly, the system
+places a small simulated bet on what the models say.
+
+**Paper trading** means no real money is at risk — every "trade" is tracked in a database so we can
+measure how well the strategy would have performed in practice.
+""")
+
+        with st.expander("**How does the system find trades?**"):
+            st.markdown("""
+Every 30 minutes the system:
+
+1. **Fetches the latest forecasts** from two professional weather models — ECMWF (European) and GFS (US).
+2. **Compares those forecasts** to the prices on Polymarket weather markets.
+3. **Calculates the "edge"** — the gap between what the models say and what the market implies.
+4. **Places a simulated bet** when the edge is large enough to be worth acting on (after accounting for fees).
+
+The markets resolve against real weather-station measurements (e.g. the official thermometer at JFK airport),
+so the system targets markets where it believes it has a more accurate forecast than the crowd.
+""")
+
+        with st.expander("**What do the numbers mean?**"):
+            st.markdown("""
+| Metric | What it means | Is bigger better? |
+|---|---|---|
+| **Total P&L** | Simulated profit or loss in dollars | Higher = better |
+| **Win Rate** | Percentage of bets that were correct | Higher = better (aim for >55%) |
+| **Profit Factor** | Every $1 lost, how many $$ were won | >1.0 means profitable |
+| **Sharpe Ratio** | Returns relative to the risk taken | >1.0 is good |
+| **Max Drawdown** | Biggest loss streak from peak to trough | Smaller (less negative) = better |
+| **Avg Edge** | Average probability advantage per trade | Higher = better |
+| **Expectancy** | Average $ profit per trade | Should be positive |
+| **Brier Score** | Forecast accuracy — how close were the probability estimates? | Lower = better (perfect = 0) |
+
+The **equity curve** on the Overview tab shows cumulative P&L over time — a steadily rising line means the
+strategy is working consistently.
+""")
+
+        with st.expander("**What is 'edge'?**"):
+            st.markdown("""
+**Edge** is the difference between what our weather model thinks the probability is and what the market
+is pricing.
+
+**Example:**
+- Our model says there's a **72% chance** the high temperature at JFK will exceed 85°F tomorrow.
+- The Polymarket contract is trading at **50 cents** (implying a 50% probability).
+- The edge is roughly **72% − 50% = 22%** — the market appears to be underpricing this outcome.
+
+After subtracting the platform fee (~2%), the **net edge** would be ~20%. The system only bets when
+the net edge clears a minimum threshold (typically around 5–10%).
+""")
+
+        with st.expander("**How are bet sizes decided?**"):
+            st.markdown("""
+The system uses a formula called the **Kelly Criterion** to size bets — the bigger the edge, the more
+it bets, but it never bets recklessly.
+
+Specifically it uses "quarter-Kelly" — a conservative version that keeps bets small:
+
+- **Maximum single bet:** 10% of the bankroll
+- **Maximum total exposure:** 60% of the bankroll at any time
+- Bets are also scaled down when the two weather models (ECMWF and GFS) disagree with each other
+
+This means most individual bets will be 1–3% of the bankroll, keeping losses manageable even during
+a losing streak.
+""")
+
+        with st.expander("**What are the stations and metrics?**"):
+            st.markdown("""
+Each trade targets a specific **weather station** and **weather metric**:
+
+**Stations** are official airport weather measurement sites, for example:
+- **KJFK** — JFK Airport, New York
+- **KLGA** — LaGuardia Airport, New York
+- **KORD** — O'Hare Airport, Chicago
+- **NZWN** — Wellington Airport, New Zealand
+
+**Metrics** are what's being measured:
+- **TMAX** — Daily high temperature (°F)
+- **TMIN** — Daily low temperature (°F)
+- **PRCP** — Precipitation (rain/snow amount)
+
+Each Polymarket market asks something like *"Will the high temperature at JFK exceed 85°F on July 4th?"*
+The system bets on the temperature bin it thinks is most likely.
+""")
+
+        with st.expander("**What does 'resolution' mean?**"):
+            st.markdown("""
+A trade **resolves** when the market closes and the actual weather outcome is known.
+
+For example, if the market asked *"Will TMAX at JFK be above 85°F on July 4th?"*:
+- On July 5th, the official weather record is checked.
+- If the high was 88°F, the "Yes" side wins.
+- The system records whether its simulated bet was correct and calculates the P&L.
+
+The **Open Positions** tab shows bets that haven't resolved yet. The **History** tab shows all
+resolved bets and their outcomes.
+
+The system automatically checks for resolutions every 30 minutes while running.
+""")
+
+        with st.expander("**What should I be watching for?**"):
+            st.markdown("""
+**Signs the strategy is healthy:**
+- Equity curve trending upward over time
+- Win rate consistently above 55%
+- Profit Factor above 1.2
+- Brier scores below 0.20 (forecast model is accurate)
+- Drawdown staying above −10%
+
+**Signs to investigate:**
+- Win rate dropping below 50% for an extended period
+- Large sudden drawdowns
+- Very few signals being generated (the system may have paused due to model disagreement)
+- Brier scores rising above 0.25 (forecasts degrading in accuracy)
+
+Use the **timeframe filter** in the sidebar to zoom into recent performance vs. all-time performance.
+If recent numbers look worse than all-time, the strategy may be going through a rough patch — that's
+normal, but worth monitoring.
+""")
 
     # ── Auto-refresh ───────────────────────────────────────────────
     if refresh_interval:
