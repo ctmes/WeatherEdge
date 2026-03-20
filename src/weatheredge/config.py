@@ -192,6 +192,7 @@ class TradingConfig:
     slippage_lambda_coeff: float = 0.5          # Kyle's Lambda for volume impact
     kelly_fraction: float = 0.25                # 25% fractional Kelly
     kelly_max_bet: float = 0.10                 # 10% bankroll cap per cluster
+    min_bet_usd: float = 5.0                    # minimum bet size — skips bets below this
     stop_loss_pct: float = 0.20                 # 20% adverse move → exit
 
     # Black-swan protection

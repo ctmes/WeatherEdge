@@ -283,6 +283,13 @@ async def run_live_paper(
             all_signals = []
             for m in markets:
                 sid = m.station_id
+                # DIAGNOSTIC: log station→market mapping to detect station_id collisions
+                # (multiple markets from different cities sharing the same station_id
+                # would produce identical model probs — a sign of a bug in enrichment).
+                logger.debug(
+                    "Evaluating market=%s station_id=%s question=%s",
+                    m.condition_id, sid, m.question[:60],
+                )
                 if sid not in forecasts:
                     continue
 

@@ -90,17 +90,18 @@ class TestNormaliseMarketProbs:
         assert all(math.isclose(p, 1 / 3, abs_tol=1e-6) for p in normed)
 
     def test_probability_floor_and_cap(self):
-        # Case where one outcome is 1.0 (resolved) and others are 0.0
-        prices = [1.0, 0.0, 0.0]
+        # 2/3 prices are zero → exceeds the 50% max_zero_fraction guard,
+        # which raises StaleMarketPricesError instead of silently flooring.
+        import pytest
+        from weatheredge.probability import StaleMarketPricesError
+        with pytest.raises(StaleMarketPricesError):
+            normalise_market_probs([1.0, 0.0, 0.0])
+
+    def test_probability_floor_with_one_zero(self):
+        # Only 1/3 prices are zero (below the 50% guard) → floor is applied.
+        prices = [0.80, 0.0, 0.15]
         normed = normalise_market_probs(prices)
-        # 1.0 should be capped, 0.0 should be floored
-        # Pass 1: [1.0, 0.0, 0.0]
-        # Pass 2 (floor/cap): [0.99, 0.01, 0.01] (sum=1.01)
-        # Pass 3 (renorm): [0.99/1.01, 0.01/1.01, 0.01/1.01]
-        assert normed[0] < 1.0
-        assert normed[0] > 0.95
         assert normed[1] > 0
-        assert normed[1] < 0.01
         assert math.isclose(sum(normed), 1.0, abs_tol=1e-6)
 
 
@@ -110,25 +111,26 @@ class TestNormaliseMarketProbs:
 
 class TestCalculateEdge:
     def test_positive_edge(self):
-        edge = calculate_edge(0.70, 0.45, fee=0.02, slippage=0.0)
+        edge = calculate_edge(0.70, 0.45, 0.45, fee=0.02, slippage=0.0)
         assert math.isclose(edge, 0.23, abs_tol=1e-6)
 
     def test_negative_edge(self):
-        edge = calculate_edge(0.30, 0.45, fee=0.02, slippage=0.0)
+        edge = calculate_edge(0.30, 0.45, 0.45, fee=0.02, slippage=0.0)
         assert edge < 0
 
     def test_fee_makes_small_edge_negative(self):
-        edge = calculate_edge(0.50, 0.49, fee=0.02, slippage=0.0)
+        edge = calculate_edge(0.50, 0.49, 0.49, fee=0.02, slippage=0.0)
         assert edge < 0  # 1% raw edge minus 2% fee = -1%
-        
+
     def test_slippage_makes_small_edge_negative(self):
-        edge = calculate_edge(0.53, 0.49, fee=0.02, slippage=0.04)
+        edge = calculate_edge(0.53, 0.49, 0.49, fee=0.02, slippage=0.04)
         assert edge < 0  # 4% raw edge, minus 4% slippage, minus 2% fee
 
     def test_all_edges(self):
         model = [0.10, 0.25, 0.40, 0.20, 0.05]
         market = [0.08, 0.22, 0.35, 0.25, 0.10]
-        edges = calculate_all_edges(model, market, fee=0.02, slippage=0.0)
+        prices = [0.08, 0.22, 0.35, 0.25, 0.10]
+        edges = calculate_all_edges(model, market, prices, fee=0.02, slippage=0.0)
         assert len(edges) == 5
 
 
@@ -138,22 +140,23 @@ class TestCalculateEdge:
 
 class TestKelly:
     def test_zero_for_negative_edge(self):
-        assert kelly_fraction(-0.05) == 0.0
+        assert kelly_fraction(-0.05, market_price=0.20) == 0.0
 
     def test_zero_for_zero_edge(self):
-        assert kelly_fraction(0.0) == 0.0
+        assert kelly_fraction(0.0, market_price=0.20) == 0.0
 
     def test_positive_edge(self):
-        kf = kelly_fraction(0.10, fraction=0.25)
+        kf = kelly_fraction(0.10, market_price=0.20, fraction=0.25)
         assert kf > 0
         assert kf <= 0.10  # max cap
 
     def test_capped_at_max(self):
-        kf = kelly_fraction(0.50, fraction=0.25, max_bet=0.10)
+        # market_price=0.50 → odds=1, full_kelly=0.50, fractional=0.125 > max_bet=0.10
+        kf = kelly_fraction(0.50, market_price=0.50, fraction=0.25, max_bet=0.10)
         assert kf == 0.10
 
     def test_recommended_bet(self):
-        bet = recommended_bet_usd(0.10, bankroll=10_000, fraction=0.25)
+        bet = recommended_bet_usd(0.10, market_price=0.20, bankroll=10_000, fraction=0.25)
         assert bet > 0
         assert bet <= 1000  # 10% of bankroll
 

@@ -497,7 +497,11 @@ def _raw_to_parsed_market(item: dict) -> ParsedMarket | None:
         station = get_station(market.station_id) if market.station_id else None
         market_unit = station.preferred_unit if (station and station.preferred_unit) else detected_unit
 
-        if market_unit == "F" and market.bins:
+        # Convert bins F→C only when parse_resolution_rules did NOT already convert
+        # them (i.e. detected_unit != "F").  When detected_unit=="F", parse_resolution_rules
+        # already converted the bins to Celsius internally — running this block again
+        # would double-convert, shifting values into the sub-zero range.
+        if market_unit == "F" and market.bins and detected_unit != "F":
             market.bins = [
                 (
                     fahrenheit_to_celsius(low) if low != float("-inf") else float("-inf"),
@@ -541,7 +545,7 @@ _METRIC_PATTERNS = {
 _BIN_UNDER = re.compile(r"[Uu]nder\s+([\d.]+)")
 _BIN_OVER = re.compile(r"[Oo]ver\s+([\d.]+)")
 _BIN_RANGE = re.compile(
-    r"([\d.]+)\s*[-–]\s*([\d.]+)\s*(?:°|degrees?\b)",
+    r"([\d.]+)\s*[-–]\s*([\d.]+)\s*(?:°[FC]?|degrees?\b)?",
     re.IGNORECASE,
 )
 

@@ -91,6 +91,7 @@ class TestApplyCalibration:
         bias = StationBias(
             station_id="NZWN",
             tmax_bias_summer=-1.5,
+            tmax_p_values={"summer": 0.05},  # statistically significant → bias applied
         )
         calibrated = apply_calibration(
             forecast_mean=22.0,

@@ -15,7 +15,7 @@ from weatheredge.calibration import StationBias, apply_calibration, apply_calibr
 from weatheredge.config import TRADING
 from weatheredge.forecast import AtmosphericRegime, fetch_forecast, fetch_regime_data
 from weatheredge.models import EdgeSignal, ForecastResult, ParsedMarket
-from weatheredge.polymarket import fetch_weather_markets, parse_bins_from_outcomes, enrich_markets_with_live_prices
+from weatheredge.polymarket import fetch_weather_markets, parse_bins_from_outcomes, enrich_markets_with_live_prices, fahrenheit_to_celsius
 from weatheredge.probability import (
     StaleMarketPricesError,
     calculate_edge,
@@ -316,7 +316,25 @@ def _process_market(
         "signals_found": 0,
     }
 
-    bins = parse_bins_from_outcomes(market.outcomes) if not market.bins else market.bins
+    if not market.bins:
+        raw_bins = parse_bins_from_outcomes(market.outcomes)
+        # Apply F→C conversion if the station expects Fahrenheit bins but Open-Meteo
+        # returns Celsius forecasts. Without this the bin values (e.g. 70, 75, 80°F)
+        # are compared directly against Celsius means (~24°C), giving ~100% model prob
+        # for the cold-tail bin and phantom edge on every US summer market.
+        _fb_station = get_station(market.station_id) if market.station_id else None
+        if _fb_station and _fb_station.preferred_unit == "F":
+            bins = [
+                (
+                    fahrenheit_to_celsius(lo) if lo != float("-inf") else float("-inf"),
+                    fahrenheit_to_celsius(hi) if hi != float("inf") else float("inf"),
+                )
+                for lo, hi in raw_bins
+            ]
+        else:
+            bins = raw_bins
+    else:
+        bins = market.bins
     if not bins:
         detail["skip_reason"] = "no parseable bins"
         return [], detail
@@ -475,8 +493,13 @@ def _process_market(
             i, market, orderbooks
         )
 
-        if mkt_p <= 0.001:
-            logger.debug("Skipping bin %d: market price too low (%.4f)", i, mkt_p)
+        if mkt_p < 0.05:
+            logger.warning(
+                "BLOCKED LOW-PRICE: market=%s station=%s bin=%d mkt_p=%.4f bins=%s "
+                "forecast_mean=%.2f forecast_std=%.2f model_prob=%.4f bins_source=%s",
+                market.condition_id, market.station_id, i, mkt_p, bins, mean, std, mp,
+                "market.bins" if market.bins else "fallback:parse_bins_from_outcomes",
+            )
             continue
 
         combined_multiplier = regime_assessment.confidence_multiplier * integrity_multiplier
@@ -490,47 +513,15 @@ def _process_market(
             )
             continue
 
-        # Preliminary screen with rough slippage estimate
+        # Pass 1: fast rejection with 1%-bankroll slippage proxy.
         preliminary_slip = estimate_slippage(
             bet_size_usd=bankroll * 0.01,
             market_volume=market.volume,
         )
-        edge = calculate_edge(mp, mkt_p, mkt_p, dynamic_slippage=preliminary_slip)
-
-        # Apply regime + integrity multipliers (integrity_multiplier set by _resolve_market_price)
-        combined_multiplier = regime_assessment.confidence_multiplier * integrity_multiplier
-
-        # Apply regime confidence multiplier to sizing
-        if edge >= edge_threshold and combined_multiplier > 0:
-            adjusted_edge = edge * combined_multiplier
-            kf = kelly_fraction(adjusted_edge, mkt_p)
-            bet = recommended_bet_usd(adjusted_edge, mkt_p, bankroll)
-
-            # Cap bet to max allowed (3% per config/safety)
-            if bet > bankroll * 0.03:
-                bet = bankroll * 0.03
-
-            # Refine slippage now that we know the actual bet size
-            dyn_slippage = estimate_slippage(
-                bet_size_usd=bet,
-                market_volume=market.volume,
-            )
-
-            # Recalculate edge with refined slippage
-            refined_edge = calculate_edge(mp, mkt_p, mkt_p, dynamic_slippage=dyn_slippage)
-            if refined_edge < edge_threshold:
-                # Edge evaporated once we accounted for realistic slippage
-                continue
-
-        # FIX #1: pass market_price (mkt_p) to calculate_edge so the updated
-        # signature is satisfied. Same for kelly_fraction / recommended_bet_usd.
-        preliminary_edge = calculate_edge(
-            mp, mkt_p, mkt_p, dynamic_slippage=preliminary_slip
-        )
-        if preliminary_edge < edge_threshold:
+        if calculate_edge(mp, mkt_p, mkt_p, dynamic_slippage=preliminary_slip) < edge_threshold:
             continue
 
-        # Refine bet size using actual orderbook depth
+        # Pass 2: refine slippage using a realistic rough bet cap, then recheck.
         rough_bet = min(bankroll * TRADING.kelly_max_bet, bankroll * 0.03)
         dyn_slippage = estimate_slippage(
             bet_size_usd=rough_bet,
@@ -546,19 +537,14 @@ def _process_market(
                 else None
             ),
         )
-
-        # FIX #1: refined edge also uses correct market_price argument
         refined_edge = calculate_edge(mp, mkt_p, mkt_p, dynamic_slippage=dyn_slippage)
         if refined_edge < edge_threshold:
             continue
 
         adjusted_edge = refined_edge * combined_multiplier
-
-        # FIX #1: pass mkt_p as market_price so Kelly uses correct payout odds
         kf = kelly_fraction(adjusted_edge, mkt_p)
         bet = recommended_bet_usd(adjusted_edge, mkt_p, bankroll)
 
-        # FIX #4: use config value rather than hardcoded 0.03
         bet_cap = bankroll * TRADING.kelly_max_bet
         if bet > bet_cap:
             bet = round(bet_cap, 2)
@@ -572,6 +558,17 @@ def _process_market(
         if not allowed:
             logger.debug("Position limit blocked: %s", reason)
             continue
+
+        # DIAGNOSTIC: log any signal where the market price is surprisingly low.
+        # This reveals mis-parsed bins (Fahrenheit treated as Celsius, etc.)
+        if mkt_p < 0.10:
+            logger.warning(
+                "LOW-PRICE SIGNAL: market=%s station=%s bin=%d bins=%s "
+                "forecast_mean=%.2f forecast_std=%.2f model_prob=%.4f mkt_p=%.4f "
+                "bins_source=%s",
+                market.condition_id, market.station_id, i, bins, mean, std, mp, mkt_p,
+                "market.bins" if market.bins else "fallback:parse_bins_from_outcomes",
+            )
 
         label = market.outcomes[i] if i < len(market.outcomes) else f"Bin {i}"
         signals.append(

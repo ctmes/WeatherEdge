@@ -197,7 +197,7 @@ def recommended_bet_usd(
     bankroll: float,
     fraction: float = TRADING.kelly_fraction,
     max_bet: float = TRADING.kelly_max_bet,
-    min_bet_usd: float = 1.0,
+    min_bet_usd: float = TRADING.min_bet_usd,
 ) -> float:
     """
     Return dollar amount to bet based on Kelly sizing.
