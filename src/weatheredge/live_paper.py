@@ -325,6 +325,16 @@ async def run_live_paper(
                     if (ob := ws.get_valid_orderbook(tid)) is not None
                 }
 
+                # Live trading requires live prices — skip any market where the
+                # WebSocket hasn't delivered a fresh snapshot yet (e.g. race
+                # condition immediately after subscription, or stale connection).
+                if not valid_orderbooks:
+                    logger.debug(
+                        "Skipping %s — no live orderbook snapshot available yet",
+                        m.question[:60],
+                    )
+                    continue
+
                 # Step 3: run algo — price used here is the live orderbook mid.
                 # Pass current DB exposure so position limits are checked against
                 # real open positions, not the default 0.0 (which always passes).
@@ -335,6 +345,7 @@ async def run_live_paper(
                     current_market_exposure=_exp["market_exposure"],
                     current_total_exposure=_exp["total_exposure"],
                     orderbooks=valid_orderbooks,
+                    require_live=True,
                 )
                 all_signals.extend(signals)
 

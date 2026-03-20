@@ -231,6 +231,7 @@ def _resolve_market_price(
     bin_index: int,
     market: ParsedMarket,
     orderbooks: dict[str, Any] | None,
+    require_live: bool = False,
 ) -> tuple[float, float, float]:
     """
     Resolve the best available market price, integrity multiplier, and
@@ -243,6 +244,9 @@ def _resolve_market_price(
       when it is thin or crossed, and 0.5 (not 0.0) when no live book
       exists (FIX #3: 0.0 was blocking all signals with no live data).
     - ``depth_usd`` is the total ask-side depth in USD, used for slippage.
+
+    If ``require_live=True``, any missing orderbook returns a zero multiplier
+    so the bin is skipped rather than priced from Gamma/CLOB fallback.
     """
     from weatheredge.filters import check_midpoint_integrity
 
@@ -252,7 +256,7 @@ def _resolve_market_price(
         if bin_index < len(market.outcome_prices)
         else 0.5
     )
-    no_book_multiplier = 0.5  # FIX #3: penalise missing book but don't zero out
+    no_book_multiplier = 0.0 if require_live else 0.5
 
     if not orderbooks:
         return gamma_price, no_book_multiplier, 0.0
@@ -303,6 +307,7 @@ def _process_market(
     current_market_exposure: float = 0.0,
     current_total_exposure: float = 0.0,
     orderbooks: dict[str, Any] | None = None,
+    require_live: bool = False,
 ) -> tuple[list[EdgeSignal], dict[str, Any] | None]:
     """Generate EdgeSignals for one market, applying calibration + regime checks."""
 
@@ -490,7 +495,7 @@ def _process_market(
         # the preliminary edge was calculated, causing the threshold check
         # to use a different price than the refined edge calculation.
         mkt_p, integrity_multiplier, ask_depth_usd = _resolve_market_price(
-            i, market, orderbooks
+            i, market, orderbooks, require_live=require_live
         )
 
         if mkt_p < 0.05:

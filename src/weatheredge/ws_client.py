@@ -196,7 +196,7 @@ class OrderbookSnapshot:
 class StaleDataGuard:
     """Watchdog to invalidate signals if WebSocket data is lagged."""
 
-    def __init__(self, max_age_seconds: float = 2.0, heartbeat_timeout: float = 10.0):
+    def __init__(self, max_age_seconds: float = 30.0, heartbeat_timeout: float = 10.0):
         self.max_age = max_age_seconds
         self.heartbeat_timeout = heartbeat_timeout
         # FIX #6: initialise to the current time so that is_fresh() does not
