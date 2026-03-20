@@ -815,8 +815,10 @@ def main() -> None:
                 lambda r: _bin_label(r["outcomes"], r["bin_index"]), axis=1
             )
             # Δ Price = how much the market has moved since we entered
+            # curr_price_pct can be NULL (no market_prices row + json_extract fails)
             active_df["price_chg_pct"] = (
-                active_df["curr_price_pct"] - active_df["bet_price_pct"]
+                pd.to_numeric(active_df["curr_price_pct"], errors="coerce")
+                - pd.to_numeric(active_df["bet_price_pct"], errors="coerce")
             ).round(1)
             # Expected return per position = (model_prob / bet_price) × bet_size
             active_df["exp_return_usd"] = (
