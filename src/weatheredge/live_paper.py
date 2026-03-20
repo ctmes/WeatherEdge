@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from weatheredge.db import init_db, get_session, get_calibrations, warn_stale_calibrations, get_pnl_summary, get_exposure_summary
-from weatheredge.logger import log_scan
+from weatheredge.logger import log_scan, log_market_prices
 from weatheredge.pipeline import fetch_weather_markets, get_station, fetch_forecast, fetch_regime_data, _process_market, AtmosphericRegime
 from weatheredge.ws_client import WeatherEdgeMarketWS, OrderbookSnapshot, TradeEvent
 from weatheredge.models import ParsedMarket, ForecastResult
@@ -348,6 +348,20 @@ async def run_live_paper(
                     require_live=True,
                 )
                 all_signals.extend(signals)
+
+                # Log current live prices so the dashboard can show Curr Price
+                # for all open positions, not just newly-signalled bins.
+                live_prices = {
+                    i: ob.mid_price
+                    for i, tid in enumerate(m.token_ids or [m.condition_id])
+                    if (ob := valid_orderbooks.get(tid)) is not None
+                    and isinstance(ob, OrderbookSnapshot)
+                }
+                if live_prices:
+                    try:
+                        await log_market_prices(m.condition_id, live_prices)
+                    except Exception:
+                        logger.warning("Failed to log live prices for %s", m.condition_id)
 
             if all_signals:
                 logger.info("Live Paper Cycle: %d signals found.", len(all_signals))
