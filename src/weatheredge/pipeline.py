@@ -366,6 +366,11 @@ def _process_market(
         detail["skip_reason"] = "no matching forecast"
         return [], detail
 
+    # ── Lead-time calculation ─────────────────────────────────────────
+    _ref_date = eval_date or date.today()
+    lead_time_days = max(0, (target_date - _ref_date).days) if target_date else 1
+    lead_time_hours = lead_time_days * 24
+
     # ── Regime check ──────────────────────────────────────────────────
     # Always build a regime object carrying the forecast-derived values.
     # CAPE/wind data from rg_by_date is supplementary; model_divergence and
@@ -387,9 +392,11 @@ def _process_market(
     regime_assessment = assess_regime(
         regime,
         ensemble_spread=forecast.tmax_std,
+        lead_time_hours=lead_time_hours,
     )
     detail["regime_flags"] = regime_assessment.flags
     detail["confidence_multiplier"] = regime_assessment.confidence_multiplier
+    detail["lead_time_days"] = lead_time_days
     if forecast.model_divergence > 0:
         detail["model_divergence"] = round(forecast.model_divergence, 2)
 
@@ -410,18 +417,22 @@ def _process_market(
         detail["skip_reason"] = "missing standard deviation"
         return [], detail
 
+    _DEFAULT_STD_DEGRADATION = 0.15  # °C/day — matches StationBias.lead_time_degradation
+
     if calibration and target_date:
         mean = apply_calibration(
             raw_mean, calibration, target_date,
             metric=market.metric or "tmax",
         )
-        std = apply_calibration_std(raw_std, calibration)
+        std = apply_calibration_std(raw_std, calibration, lead_time_days=lead_time_days)
         detail["calibration_applied"] = True
         detail["raw_mean"] = raw_mean
         detail["calibrated_mean"] = mean
     else:
         mean = raw_mean
         std = raw_std
+        if lead_time_days > 1:
+            std += _DEFAULT_STD_DEGRADATION * (lead_time_days - 1)
         detail["calibration_applied"] = False
 
     # ── Model probabilities ───────────────────────────────────────────
