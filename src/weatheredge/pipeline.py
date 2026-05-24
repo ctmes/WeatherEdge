@@ -69,12 +69,15 @@ async def run_scan(
     diagnostics: bool = False,
     orderbooks: dict[str, OrderbookSnapshot] | None = None,
     deep_scan: bool = False,
+    base_total_exposure: float = 0.0,
+    base_exposure_by_market: dict[str, float] | None = None,
 ) -> tuple[list[EdgeSignal], dict[str, ParsedMarket], ScanDiagnostics | None]:
     """
     Execute one full pipeline scan with calibration and regime checks.
 
-    FIX #6: accepts ``orderbooks`` so the standalone scanner can also
-    benefit from live orderbook data, not just live_paper.py.
+    ``base_total_exposure`` and ``base_exposure_by_market`` should be pre-populated
+    from the database by the caller (scheduler / live_paper) so that position limits
+    correctly account for already-open positions across process cycles.
     """
     diag = ScanDiagnostics() if diagnostics else None
     calibrations = calibrations or {}
@@ -182,6 +185,11 @@ async def run_scan(
 
     all_signals: list[EdgeSignal] = []
 
+    # Running exposure totals — seeded from caller-supplied DB values so that
+    # already-open positions are counted against the limits on each new signal.
+    scan_total_exposure = base_total_exposure
+    scan_exposure_by_market: dict[str, float] = dict(base_exposure_by_market or {})
+
     for station_id, market_list in station_markets.items():
         station_forecasts = forecasts.get(station_id, [])
         station_regimes = regime_data.get(station_id, [])
@@ -204,7 +212,17 @@ async def run_scan(
             signals, market_diag = _process_market(
                 market, fc_by_date, rg_by_date, station_cal, bankroll,
                 orderbooks=orderbooks,
+                current_market_exposure=scan_exposure_by_market.get(market.condition_id, 0.0),
+                current_total_exposure=scan_total_exposure,
             )
+
+            # Update running totals so subsequent markets see the correct exposure.
+            for sig in signals:
+                scan_total_exposure += sig.recommended_bet_usd
+                scan_exposure_by_market[market.condition_id] = (
+                    scan_exposure_by_market.get(market.condition_id, 0.0) + sig.recommended_bet_usd
+                )
+
             all_signals.extend(signals)
 
             if diag and market_diag:
@@ -387,7 +405,8 @@ def _process_market(
 
     # Populate regime with model-derived circuit-breaker values.
     regime.model_divergence = forecast.model_divergence
-    regime.ensemble_spread = forecast.tmax_std or 0.0
+    # Use the stored 90th–10th percentile spread, not std, so regime thresholds mean what they say.
+    regime.ensemble_spread = forecast.ensemble_spread if forecast.ensemble_spread > 0 else (forecast.tmax_std or 0.0)
 
     regime_assessment = assess_regime(
         regime,
@@ -534,26 +553,23 @@ def _process_market(
             bet_size_usd=bankroll * 0.01,
             market_volume=market.volume,
         )
-        if calculate_edge(mp, mkt_p, mkt_p, dynamic_slippage=preliminary_slip) < edge_threshold:
+        if calculate_edge(mp, mkt_p, dynamic_slippage=preliminary_slip) < edge_threshold:
             continue
 
         # Pass 2: refine slippage using a realistic rough bet cap, then recheck.
         rough_bet = min(bankroll * TRADING.kelly_max_bet, bankroll * 0.03)
+        tid_i = market.token_ids[i] if i < len(market.token_ids) else ""
+        book_i = orderbooks.get(tid_i) if orderbooks else None
         dyn_slippage = estimate_slippage(
             bet_size_usd=rough_bet,
             market_volume=market.volume,
             order_book_depth=(
-                [(lvl.price, lvl.price * lvl.size) for lvl in orderbooks.get(
-                    market.token_ids[i] if i < len(market.token_ids) else "", {}
-                ).asks]
-                if orderbooks and isinstance(
-                    orderbooks.get(market.token_ids[i] if i < len(market.token_ids) else ""),
-                    OrderbookSnapshot,
-                )
+                [(lvl.price, lvl.price * lvl.size) for lvl in book_i.asks]
+                if isinstance(book_i, OrderbookSnapshot)
                 else None
             ),
         )
-        refined_edge = calculate_edge(mp, mkt_p, mkt_p, dynamic_slippage=dyn_slippage)
+        refined_edge = calculate_edge(mp, mkt_p, dynamic_slippage=dyn_slippage)
         if refined_edge < edge_threshold:
             continue
 

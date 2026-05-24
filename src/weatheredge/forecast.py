@@ -103,17 +103,14 @@ def _blend_ensembles(
             continue
 
         r2 = e2_by_date[valid_date]
-        
-        # Approximate blending by weighting by member count
-        # ECMWF = 51, BOM = 18
-        n1, n2 = 51, 18
-        # If it's already a blended ensemble, this logic might need care, 
-        # but for now we assume e1 is ECMWF and e2 is BOM.
-        
+
+        # Use the recorded member counts from each ensemble result.
+        n1 = r1.ensemble_member_count or 1
+        n2 = r2.ensemble_member_count or 1
+
         def _blend(m1: float, s1: float, m2: float, s2: float, c1: int, c2: int):
-            # Combined Mean
             m_new = (m1 * c1 + m2 * c2) / (c1 + c2)
-            # Combined Variance: Var = [ (n1-1)s1^2 + (n2-1)s2^2 + n1*m1^2 + n2*m2^2 - (n1+n2)m_new^2 ] / (n1+n2-1)
+            # Pooled variance formula for combining two sample distributions.
             v1, v2 = s1**2, s2**2
             ss1 = (c1 - 1) * v1 + c1 * m1**2
             ss2 = (c2 - 1) * v2 + c2 * m2**2
@@ -121,10 +118,13 @@ def _blend_ensembles(
             return m_new, float(np.sqrt(max(v_new, 0.01)))
 
         tmax_m, tmax_s = _blend(r1.tmax_mean, r1.tmax_std, r2.tmax_mean, r2.tmax_std, n1, n2)
-        
+
         tmin_m, tmin_s = None, None
         if r1.tmin_mean is not None and r2.tmin_mean is not None:
-             tmin_m, tmin_s = _blend(r1.tmin_mean, r1.tmin_std or 2.0, r2.tmin_mean, r2.tmin_std or 2.0, n1, n2)
+            tmin_m, tmin_s = _blend(r1.tmin_mean, r1.tmin_std or 2.0, r2.tmin_mean, r2.tmin_std or 2.0, n1, n2)
+
+        # For a normal distribution, 90th–10th percentile ≈ 2.56σ.
+        blended_spread = tmax_s * 2.56
 
         results.append(ForecastResult(
             station_id=r1.station_id,
@@ -134,6 +134,8 @@ def _blend_ensembles(
             tmin_mean=tmin_m,
             tmin_std=tmin_s,
             models_used=sorted(list(set(r1.models_used + r2.models_used))),
+            ensemble_spread=blended_spread,
+            ensemble_member_count=n1 + n2,
         ))
 
     return results
@@ -208,11 +210,20 @@ async def fetch_regime_data(
     results: list[AtmosphericRegime] = []
     for day_str in sorted(daily.keys()):
         d = daily[day_str]
+        # Wind direction is a circular variable (0°/360° wrap-around).
+        # Arithmetic mean fails near 0°/360° (e.g. 350° and 10° → 180° instead of 0°).
+        if d["wd"]:
+            wd_rad = np.radians(d["wd"])
+            circ_mean_rad = np.arctan2(np.mean(np.sin(wd_rad)), np.mean(np.cos(wd_rad)))
+            wind_dir = float(np.degrees(circ_mean_rad) % 360)
+        else:
+            wind_dir = None
+
         results.append(AtmosphericRegime(
             station_id="",  # filled by caller
             valid_date=date.fromisoformat(day_str),
             cape_max=max(d["cape"]) if d["cape"] else None,
-            wind_dir_850hpa=float(np.mean(d["wd"])) if d["wd"] else None,
+            wind_dir_850hpa=wind_dir,
             wind_speed_850hpa=float(np.mean(d["ws"])) if d["ws"] else None,
         ))
 
@@ -260,6 +271,8 @@ async def _fetch_ensemble(
                 tmin_mean=r.get("tmin_mean"),
                 tmin_std=r.get("tmin_std"),
                 models_used=r.get("models_used", []),
+                ensemble_spread=r.get("ensemble_spread", 0.0),
+                ensemble_member_count=r.get("ensemble_member_count", 1),
             )
             for r in cached
         ]
@@ -309,15 +322,18 @@ async def _fetch_ensemble(
                     station_id="",
                     valid_date=date.fromisoformat(d),
                     tmax_mean=float(tmax_raw[i]) if tmax_raw[i] is not None else 0,
-                    tmax_std=2.0,  # default
+                    tmax_std=2.0,
                     tmin_mean=float(tmin_raw[i]) if i < len(tmin_raw) and tmin_raw[i] is not None else None,
                     tmin_std=2.0,
                     models_used=[f"{model}_ensemble"],
+                    ensemble_spread=2.0 * 2.56,
+                    ensemble_member_count=1,
                 )
                 for i, d in enumerate(dates) if i < len(tmax_raw)
             ]
         return []
 
+    member_count = len(tmax_members)
     results: list[ForecastResult] = []
     n_days = len(dates)
 
@@ -331,7 +347,7 @@ async def _fetch_ensemble(
         tmax_arr = np.array(tmax_vals)
         tmin_arr = np.array(tmin_vals) if tmin_vals else None
 
-        # Compute spread (90th - 10th percentile) for regime flagging
+        # 90th–10th percentile spread across members for regime flagging.
         spread = float(np.percentile(tmax_arr, 90) - np.percentile(tmax_arr, 10))
 
         results.append(ForecastResult(
@@ -342,6 +358,8 @@ async def _fetch_ensemble(
             tmin_mean=float(np.mean(tmin_arr)) if tmin_arr is not None and len(tmin_arr) > 0 else None,
             tmin_std=float(np.std(tmin_arr)) if tmin_arr is not None and len(tmin_arr) > 1 else 2.0,
             models_used=[f"{model}_ensemble"],
+            ensemble_spread=spread,
+            ensemble_member_count=member_count,
         ))
 
     # Cache results
@@ -354,6 +372,8 @@ async def _fetch_ensemble(
             "tmin_mean": r.tmin_mean,
             "tmin_std": r.tmin_std,
             "models_used": r.models_used,
+            "ensemble_spread": r.ensemble_spread,
+            "ensemble_member_count": r.ensemble_member_count,
         }
     write_cache(_SUBDIR, ck, [_fc_to_dict(r) for r in results])
 
@@ -468,16 +488,20 @@ def _build_multimodel_ensemble(
                 if not (np.isnan(ev) or np.isnan(gv)):
                     model_divergence = abs(ev - gv)
 
+        tmax_std = float(np.std(tmax_arr)) if len(tmax_arr) > 1 else DEFAULT_STD
         results.append(
             ForecastResult(
                 station_id="",
                 valid_date=date.fromisoformat(date_str),
                 tmax_mean=float(np.mean(tmax_arr)),
-                tmax_std=float(np.std(tmax_arr)) if len(tmax_arr) > 1 else DEFAULT_STD,
+                tmax_std=tmax_std,
                 tmin_mean=float(np.mean(tmin_arr)) if tmin_arr is not None and len(tmin_arr) > 0 else None,
                 tmin_std=float(np.std(tmin_arr)) if tmin_arr is not None and len(tmin_arr) > 1 else DEFAULT_STD,
                 models_used=used_models,
                 model_divergence=model_divergence,
+                # Inter-model std proxies ensemble spread for the regime circuit-breaker.
+                ensemble_spread=tmax_std * 2.56,
+                ensemble_member_count=len(tmax_arr),
             )
         )
 

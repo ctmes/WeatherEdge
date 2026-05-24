@@ -255,6 +255,12 @@ class ForecastResult:
     # 0.0 when only one model is available or when using the ensemble endpoint.
     # Used by regime.assess_regime to fire the MODEL_DIVERGENCE_HIGH guard.
     model_divergence: float = 0.0
+    # 90th–10th percentile tmax spread across ensemble members (°C).
+    # Populated by _fetch_ensemble; used by the pipeline instead of tmax_std
+    # so the regime circuit-breaker thresholds mean what they say.
+    ensemble_spread: float = 0.0
+    # Number of ensemble members that contributed to this forecast.
+    ensemble_member_count: int = 1
 
 
 @dataclass
@@ -273,6 +279,6 @@ class EdgeSignal:
     net_edge: float
     kelly_fraction: float
     recommended_bet_usd: float
-    regime_flags: dict[str, Any] = field(default_factory=dict)
+    regime_flags: list[str] = field(default_factory=list)
     confidence_multiplier: float = 1.0
     slippage: float = 0.0

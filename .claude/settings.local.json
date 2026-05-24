@@ -29,7 +29,26 @@
       "Bash(python -:*)",
       "WebSearch",
       "Bash(curl -sI https://r2.pmxt.dev/polymarket_orderbook_2026-03-06T06.parquet)",
-      "Bash(sqlite3 \"/Users/colin/August Labs/WeatherEdge/data/weatheredge.db\" \".schema\")"
+      "Bash(sqlite3 \"/Users/colin/August Labs/WeatherEdge/data/weatheredge.db\" \".schema\")",
+      "Bash(Get-ChildItem -Path \"d:\\\\Projects\\\\WeatherEdge\" -Recurse -File)",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "Bash(Sort-Object)",
+      "Bash(grep -E '\\\\.py$')",
+      "Bash(python -m pytest tests/test_probability.py tests/test_matching.py tests/test_stations.py -x -q)",
+      "Bash(pip install *)",
+      "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(python -m pytest tests/test_probability.py -x -q)",
+      "Bash(python -m pip install -e . --quiet)",
+      "Bash(python -m pytest tests/ -x -q --ignore=tests/test_integration.py)",
+      "Bash(python -m pytest tests/test_probability.py tests/test_matching.py tests/test_stations.py tests/test_cache.py tests/test_slippage.py tests/test_analytics.py -v)",
+      "Bash(ls \"C:\\\\Users\\\\Nebula PC\\\\.ssh\\\\\" 2>/dev/null || echo \"no .ssh dir\")",
+      "Read(//c/Users/Nebula PC/.ssh\" 2>/dev/**)",
+      "PowerShell(Get-ChildItem \"$env:USERPROFILE\\\\.ssh\\\\\" -ErrorAction SilentlyContinue | Select-Object Name, Length)",
+      "PowerShell(Test-Path \"$env:USERPROFILE\\\\.ssh\")",
+      "Bash(mkdir -p \"C:/Users/Nebula PC/.claude/projects/d--Projects-WeatherEdge/memory\")"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\Nebula PC\\.claude\\projects\\d--Projects-WeatherEdge"
     ]
   }
 }

@@ -14,9 +14,11 @@ import logging
 import random
 import signal
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
-from weatheredge.db import init_db, get_session, get_calibrations, warn_stale_calibrations, get_pnl_summary
+UTC = timezone.utc
+
+from weatheredge.db import init_db, get_session, get_calibrations, warn_stale_calibrations, get_pnl_summary, get_exposure_summary
 from weatheredge.logger import log_scan, log_market_prices
 from weatheredge.pipeline import run_scan
 from weatheredge.calibrate_all import run_all_calibrations
@@ -65,7 +67,7 @@ async def run_loop(
         from weatheredge.models import StationCalibration
         async with get_session() as session:
             youngest_update = await session.scalar(select(func.max(StationCalibration.last_updated)))
-            if youngest_update is None or (datetime.utcnow() - youngest_update).days >= 7:
+            if youngest_update is None or (datetime.now(UTC).replace(tzinfo=None) - youngest_update).days >= 7:
                 needs_refresh = True
                 logger.info("Calibrations are older than 7 days (or missing). Auto-refreshing.")
                 
@@ -169,11 +171,23 @@ async def run_loop(
 async def _run_one_cycle(bankroll: float, calibrations: dict | None = None) -> None:
     """Execute one full scan and log results."""
     t0 = time.monotonic()
-    scan_time = datetime.utcnow()
+    scan_time = datetime.now(UTC).replace(tzinfo=None)
+
+    # Load current open exposure from DB so position limits account for existing positions.
+    base_total_exposure = 0.0
+    try:
+        async with get_session() as session:
+            exp = await get_exposure_summary(session)
+        base_total_exposure = exp.get("total_exposure", 0.0)
+    except Exception:
+        logger.warning("Failed to query open exposure — position limits will use 0 as baseline.")
 
     try:
         signals, markets_by_id, diag = await run_scan(
-            bankroll=bankroll, calibrations=calibrations, diagnostics=True,
+            bankroll=bankroll,
+            calibrations=calibrations,
+            diagnostics=True,
+            base_total_exposure=base_total_exposure,
         )
     except Exception:
         logger.exception("Scan FAILED — will retry next cycle.")

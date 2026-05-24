@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, AsyncGenerator
+
+UTC = timezone.utc
 
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -20,6 +22,15 @@ from sqlalchemy.ext.asyncio import (
 
 from weatheredge.config import DATABASE_URL
 from weatheredge.models import Base
+
+
+def _dialect_insert(model):
+    """Return the dialect-appropriate INSERT constructor for upsert operations."""
+    if DATABASE_URL.startswith(("postgresql://", "postgresql+", "postgres://")):
+        from sqlalchemy.dialects.postgresql import insert
+    else:
+        from sqlalchemy.dialects.sqlite import insert
+    return insert(model)
 
 logger = logging.getLogger("weatheredge.db")
 
@@ -240,10 +251,9 @@ async def upsert_market(session: AsyncSession, market_data: dict) -> None:
     ``market_data`` must include ``id`` (primary key) plus any columns
     to insert/update.
     """
-    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
     from weatheredge.models import Market
 
-    stmt = sqlite_insert(Market).values(**market_data)
+    stmt = _dialect_insert(Market).values(**market_data)
     update_cols = {
         k: v for k, v in market_data.items()
         if k not in ("id", "created_at")
@@ -267,7 +277,6 @@ async def upsert_calibration(session: AsyncSession, bias: Any) -> None:
     Upsert a StationCalibration row.
     `bias` should be a StationBias object from calibration.py.
     """
-    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
     from weatheredge.models import StationCalibration
 
     data = {
@@ -285,10 +294,10 @@ async def upsert_calibration(session: AsyncSession, bias: Any) -> None:
         "tmax_p_values": bias.tmax_p_values,
         "tmin_p_values": bias.tmin_p_values,
         "lead_time_degradation": bias.lead_time_degradation,
-        "last_updated": datetime.utcnow(),
+        "last_updated": datetime.now(UTC).replace(tzinfo=None),
     }
 
-    stmt = sqlite_insert(StationCalibration).values(**data)
+    stmt = _dialect_insert(StationCalibration).values(**data)
     update_cols = {k: v for k, v in data.items() if k != "station_id"}
     stmt = stmt.on_conflict_do_update(
         index_elements=[StationCalibration.station_id],
@@ -362,7 +371,7 @@ async def warn_stale_calibrations(
         logger.warning("%sNo calibrations found in DB.", f"[{context}] " if context else "")
         return
 
-    now = datetime.utcnow()
+    now = datetime.now(UTC).replace(tzinfo=None)
     stale = {
         sid: lu for sid, lu in ages.items()
         if lu is None or (now - lu).days >= max_age_days
@@ -444,7 +453,7 @@ async def get_pnl_summary(session: AsyncSession, bankroll: float) -> dict[str, f
     from weatheredge.models import PeakBankroll, Result
     from datetime import timedelta
 
-    now = datetime.utcnow()
+    now = datetime.now(UTC).replace(tzinfo=None)
 
     async def _sum(since: datetime) -> float:
         val = await session.scalar(

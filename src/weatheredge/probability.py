@@ -129,18 +129,15 @@ def normalise_market_probs(
 def calculate_edge(
     model_prob: float,
     market_prob: float,
-    market_price: float,
     fee: float = TRADING.polymarket_fee,
     slippage: float = TRADING.assumed_slippage,
     dynamic_slippage: float | None = None,
 ) -> float:
     """
-    Net edge for a single outcome bin, accounting for slippage spread.
+    Net edge for a single outcome bin, accounting for slippage and fees.
     Positive edge → bet YES.  Negative edge → consider NO.
 
-    FIX #2: ``market_price`` is now required so Kelly can compute the
-    correct binary payout odds: ``(1 / price) - 1`` rather than always 1.0.
-
+    Kelly position sizing uses market_price separately via kelly_fraction().
     If dynamic_slippage is provided, it overrides the static slippage default.
     """
     effective_slip = dynamic_slippage if dynamic_slippage is not None else slippage
@@ -151,15 +148,14 @@ def calculate_edge(
 def calculate_all_edges(
     model_probs: list[float],
     market_probs: list[float],
-    market_prices: list[float],
     fee: float = TRADING.polymarket_fee,
     slippage: float = TRADING.assumed_slippage,
     dynamic_slippage: float | None = None,
 ) -> list[float]:
     """Calculate net edge for every bin."""
     return [
-        calculate_edge(mp, mkt, price, fee, slippage, dynamic_slippage)
-        for mp, mkt, price in zip(model_probs, market_probs, market_prices)
+        calculate_edge(mp, mkt, fee, slippage, dynamic_slippage)
+        for mp, mkt in zip(model_probs, market_probs)
     ]
 
 

@@ -85,12 +85,20 @@ class CalibrationPair:
 # Southern/Northern hemisphere season detection
 # =========================================================================
 
-_SH_STATIONS = {"NZWN", "YSSY", "YMML"}  # Southern Hemisphere
+def _is_southern_hemisphere(station_id: str) -> bool:
+    """Return True if the station is in the Southern Hemisphere, using coordinates."""
+    from weatheredge.stations import get_station as _get_station
+    station = _get_station(station_id)
+    if station is not None:
+        return station.latitude < 0
+    # Unknown station: fall back to a conservative list of known SH IDs.
+    return station_id.upper() in {"NZWN", "YSSY", "YMML"}
+
 
 def get_season(station_id: str, d: date) -> str:
     """Return season name for a given station and date."""
     month = d.month
-    is_sh = station_id.upper() in _SH_STATIONS
+    is_sh = _is_southern_hemisphere(station_id)
 
     if is_sh:
         if month in (12, 1, 2):

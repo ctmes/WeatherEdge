@@ -9,8 +9,10 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from typing import Any
+
+UTC = timezone.utc
 
 logger = logging.getLogger("weatheredge.safety")
 
@@ -36,8 +38,11 @@ def validate_data_freshness(
     Reject data older than max_age_minutes.
     Raises StaleDataError if data is too old.
     """
-    now = datetime.utcnow()
-    age = now - data_timestamp
+    now = datetime.now(UTC)
+    # Accept both aware and naive timestamps; normalise to naive UTC for comparison.
+    if data_timestamp.tzinfo is not None:
+        data_timestamp = data_timestamp.replace(tzinfo=None)
+    age = now.replace(tzinfo=None) - data_timestamp
     age_minutes = age.total_seconds() / 60
 
     if age_minutes > max_age_minutes:
@@ -76,9 +81,17 @@ class ExecutionGuard:
         """
         Check whether an order can be placed. Raises if limits breached.
         """
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         minute_key = now.strftime("%Y%m%d%H%M")
         day_key = now.strftime("%Y%m%d")
+
+        # Evict stale minute keys to prevent unbounded dict growth.
+        # Keep only the current minute and the one before it.
+        prev_minute = (now.replace(second=0, microsecond=0).timestamp() - 60)
+        prev_key = datetime.fromtimestamp(prev_minute, tz=UTC).strftime("%Y%m%d%H%M")
+        stale = [k for k in self._minute_counts if k not in (minute_key, prev_key)]
+        for k in stale:
+            del self._minute_counts[k]
 
         # Per-minute rate limit
         if self._minute_counts[minute_key] >= self.max_orders_per_minute:
@@ -97,7 +110,7 @@ class ExecutionGuard:
 
     def record_execution(self, market_id: str) -> None:
         """Record that an order was placed."""
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         minute_key = now.strftime("%Y%m%d%H%M")
         day_key = now.strftime("%Y%m%d")
 
@@ -118,12 +131,16 @@ class PositionLimits:
     """
     Hard position limits from the Risk Manager persona.
     All values are fractions of bankroll.
+
+    These match TradingConfig (config.py) as the single source of truth:
+      max_single_market_cluster == TradingConfig.max_single_market_exposure (0.10)
+      max_total_deployed        == TradingConfig.max_total_exposure          (0.60)
     """
 
-    max_single_bin: float = 0.03          # 3% per bin
-    max_single_market_cluster: float = 0.08  # 8% per market
+    max_single_bin: float = 0.03             # 3% per bin (more conservative than Kelly cap)
+    max_single_market_cluster: float = 0.10  # 10% per market — matches TradingConfig
     max_correlated_exposure: float = 0.25    # 25% same weather system
-    max_total_deployed: float = 0.50         # 50% total
+    max_total_deployed: float = 0.60         # 60% total — matches TradingConfig
     emergency_reserve: float = 0.20          # 20% never touch
 
 
@@ -154,13 +171,13 @@ def check_position_limits(
             f"(${bankroll * limits.max_single_market_cluster:.0f})"
         )
 
-    # Total deployed limit
+    # Total deployed limit — emergency_reserve reduces the effective cap.
     new_total = current_total_exposure + proposed_bet_usd
-    max_deployable = bankroll * (1 - limits.emergency_reserve) * limits.max_total_deployed / (1 - limits.emergency_reserve)
-    if new_total > bankroll * limits.max_total_deployed:
+    deployable_cap = bankroll * (1.0 - limits.emergency_reserve) * limits.max_total_deployed
+    if new_total > deployable_cap:
         return False, (
             f"Total exposure ${new_total:.0f} exceeds deployment limit "
-            f"(${bankroll * limits.max_total_deployed:.0f})"
+            f"(${deployable_cap:.0f})"
         )
 
     return True, "OK"

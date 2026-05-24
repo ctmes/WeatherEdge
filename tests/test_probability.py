@@ -111,26 +111,25 @@ class TestNormaliseMarketProbs:
 
 class TestCalculateEdge:
     def test_positive_edge(self):
-        edge = calculate_edge(0.70, 0.45, 0.45, fee=0.02, slippage=0.0)
+        edge = calculate_edge(0.70, 0.45, fee=0.02, slippage=0.0)
         assert math.isclose(edge, 0.23, abs_tol=1e-6)
 
     def test_negative_edge(self):
-        edge = calculate_edge(0.30, 0.45, 0.45, fee=0.02, slippage=0.0)
+        edge = calculate_edge(0.30, 0.45, fee=0.02, slippage=0.0)
         assert edge < 0
 
     def test_fee_makes_small_edge_negative(self):
-        edge = calculate_edge(0.50, 0.49, 0.49, fee=0.02, slippage=0.0)
+        edge = calculate_edge(0.50, 0.49, fee=0.02, slippage=0.0)
         assert edge < 0  # 1% raw edge minus 2% fee = -1%
 
     def test_slippage_makes_small_edge_negative(self):
-        edge = calculate_edge(0.53, 0.49, 0.49, fee=0.02, slippage=0.04)
+        edge = calculate_edge(0.53, 0.49, fee=0.02, slippage=0.04)
         assert edge < 0  # 4% raw edge, minus 4% slippage, minus 2% fee
 
     def test_all_edges(self):
         model = [0.10, 0.25, 0.40, 0.20, 0.05]
         market = [0.08, 0.22, 0.35, 0.25, 0.10]
-        prices = [0.08, 0.22, 0.35, 0.25, 0.10]
-        edges = calculate_all_edges(model, market, prices, fee=0.02, slippage=0.0)
+        edges = calculate_all_edges(model, market, fee=0.02, slippage=0.0)
         assert len(edges) == 5
 
 
