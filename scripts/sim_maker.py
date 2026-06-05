@@ -253,6 +253,38 @@ async def fetch_event_children(event_id: str) -> list[dict[str, Any]]:
     return children
 
 
+def load_recorded_paths(glob_pattern: str, token_ids: list[str]) -> dict[str, list[tuple[int, float]]]:
+    """
+    Load ``{token_id: [(ts_ms, mid), ...]}`` from the JSONL files written by
+    scripts.record_books (the live recorder). Lets sim_maker run on freshly
+    collected data instead of the (dead) pmxt archive.
+    """
+    import glob as _glob
+
+    want = set(token_ids)
+    paths: dict[str, list[tuple[int, float]]] = {t: [] for t in token_ids}
+    files = sorted(_glob.glob(glob_pattern))
+    if not files:
+        log.warning("No files matched %s", glob_pattern)
+    for fp in files:
+        with open(fp) as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                t = row.get("token")
+                if t not in want:
+                    continue
+                mid, ts = row.get("mid"), row.get("ts")
+                if mid is None or ts is None or not (0.0 < float(mid) < 1.0):
+                    continue
+                paths[t].append((int(ts), float(mid)))
+    for t in paths:
+        paths[t].sort(key=lambda x: x[0])
+    return paths
+
+
 def _parse_hours(spec: str) -> range:
     if "-" in spec:
         a, b = spec.split("-", 1)
@@ -284,8 +316,6 @@ def _report(label: str, path: list[tuple[int, float]], resolves: int, args) -> d
 
 def main(args) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    day = date.fromisoformat(args.date)
-    hours = _parse_hours(args.hours)
 
     # Resolve the set of (token_id, resolves, label) to simulate.
     targets: list[tuple[str, int, str]] = []
@@ -307,9 +337,18 @@ def main(args) -> None:
         log.info("Provide either --event-id or (--token-id and --resolves).")
         return
 
-    log.info("Loading pmxt books for %d token(s), %s hours %s (one download per hour)...",
-             len(targets), day, args.hours)
-    paths = load_price_paths([t[0] for t in targets], day, hours)
+    if args.from_records:
+        log.info("Loading recorded books from %s for %d token(s)...", args.from_records, len(targets))
+        paths = load_recorded_paths(args.from_records, [t[0] for t in targets])
+    else:
+        if not args.date:
+            log.info("Provide --date (pmxt mode) or --from-records (recorder mode).")
+            return
+        day = date.fromisoformat(args.date)
+        hours = _parse_hours(args.hours)
+        log.info("Loading pmxt books for %d token(s), %s hours %s (one download per hour)...",
+                 len(targets), day, args.hours)
+        paths = load_price_paths([t[0] for t in targets], day, hours)
 
     log.info("\nPASSIVE MAKER  (size $%.0f/side, band %.3f, reward $%.0f/day × %.0f%% share):\n",
              args.size, args.band, args.reward_per_day, args.share * 100)
@@ -354,8 +393,9 @@ if __name__ == "__main__":
     ap.add_argument("--event-id", help="Resolved Polymarket event id (e.g. 536793) — simulates ALL its bins")
     ap.add_argument("--token-id", help="Single CLOB token id (alternative to --event-id; needs --resolves)")
     ap.add_argument("--resolves", type=int, choices=[0, 1], default=None, help="For --token-id: resolved YES(1)/NO(0)")
-    ap.add_argument("--date", required=True, help="Resolution day YYYY-MM-DD (which day's archive to load)")
-    ap.add_argument("--hours", default="12-23", help="UTC hour range to load, e.g. 12-23 (default)")
+    ap.add_argument("--date", help="pmxt mode: resolution day YYYY-MM-DD (which day's archive to load)")
+    ap.add_argument("--from-records", help="recorder mode: glob of record_books JSONL, e.g. 'data/book_recordings/books_*.jsonl'")
+    ap.add_argument("--hours", default="12-23", help="pmxt mode: UTC hour range to load, e.g. 12-23 (default)")
     ap.add_argument("--size", type=float, default=50.0, help="USD rested per side")
     ap.add_argument("--band", type=float, default=0.045, help="Quote offset from mid in price units (4.5c default)")
     ap.add_argument("--reward-per-day", type=float, default=0.0, help="This market's daily reward pool $ (from eval_rewards)")
