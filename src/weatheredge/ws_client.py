@@ -222,15 +222,25 @@ class StaleDataGuard:
 class WeatherEdgeMarketWS:
     """Customized Polymarket WS client for WeatherEdge."""
 
+    # Polymarket's book snapshot reply for a large subscription routinely exceeds
+    # the `websockets` library default frame limit of 1 MiB (2**20). When that
+    # happens the server sends a 1009 ("message too big") close and the client
+    # tears down the connection — producing the infinite reconnect storm seen in
+    # production where the orderbook cache was never populated. We raise the
+    # limit well above any realistic snapshot size.
+    DEFAULT_MAX_FRAME_BYTES = 32 * 2**20  # 32 MiB
+
     def __init__(
         self,
         url: str = WSS_MARKET_URL,
         reconnect_interval: float = 5.0,
         ping_interval: float = 20.0,
+        max_size: int | None = DEFAULT_MAX_FRAME_BYTES,
     ):
         self.url = url
         self.reconnect_interval = reconnect_interval
         self.ping_interval = ping_interval
+        self.max_size = max_size
         self._ws_connect, self._connection_closed = _load_websockets()
 
         self._ws = None
@@ -254,6 +264,9 @@ class WeatherEdgeMarketWS:
         kwargs: Dict[str, Any] = {
             "ping_interval": self.ping_interval,
             "additional_headers": headers,
+            # Raise (or disable, when None) the inbound frame size limit so a
+            # large book snapshot cannot trigger a 1009 close + reconnect loop.
+            "max_size": self.max_size,
         }
 
         if self.url.startswith("wss://") and not VERIFY_SSL:

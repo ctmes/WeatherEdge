@@ -200,6 +200,32 @@ class TradingConfig:
     ensemble_spread_reduce: float = 4.0         # °C — reduce sizing by 50%
     ensemble_spread_no_bet: float = 6.0         # °C — no bet
 
+    # ── Forecast uncertainty (anti-overconfidence) ───────────────────────────
+    # The raw ensemble std is systematically too tight for betting: a deceptively
+    # narrow spread produced ~100% bin probabilities and the two circuit-breaker
+    # blowups.  We inflate it into a betting-grade uncertainty before computing
+    # probabilities: sqrt(ensemble_std² + model_error_std² + (per_day·days)²),
+    # floored at forecast_std_floor.
+    forecast_std_floor: float = 1.5             # °C — minimum std for any bet
+    model_error_std: float = 1.2                # °C — irreducible model error (quadrature)
+    lead_time_std_per_day: float = 0.5          # °C/day — uncertainty growth with lead time
+
+    # ── Edge realism ─────────────────────────────────────────────────────────
+    # Risk Manager: assume the true edge is a fraction of the estimated edge while
+    # the model is unproven.  Applied to every edge before thresholding/sizing.
+    edge_uncertainty_haircut: float = 0.5       # use 50% of estimated edge
+
+    # ── Model-sanity veto ────────────────────────────────────────────────────
+    # If our model is near-certain about a bin that a *liquid* market prices as
+    # very unlikely, the model is the outlier, not the market.  Refuse the bet.
+    sanity_model_prob_max: float = 0.90         # model prob at/above this is "near-certain"
+    sanity_market_prob_min: float = 0.25        # market prob at/below this is "very unlikely"
+    sanity_min_volume_usd: float = 5_000        # only veto when the market is liquid enough to trust
+
+    # ── Order-book integrity ─────────────────────────────────────────────────
+    min_market_price: float = 0.05              # never trade a bin priced below this
+    require_live_orderbook: bool = False        # if True, only trade bins backed by a real (non-synthetic) book
+
     # Live Trading Toggle
     live_trading_enabled: bool = False          # Set to True for real money (DANGEROUS)
 

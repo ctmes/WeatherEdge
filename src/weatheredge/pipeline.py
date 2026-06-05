@@ -18,8 +18,11 @@ from weatheredge.models import EdgeSignal, ForecastResult, ParsedMarket
 from weatheredge.polymarket import fetch_weather_markets, parse_bins_from_outcomes, enrich_markets_with_live_prices, fahrenheit_to_celsius
 from weatheredge.probability import (
     StaleMarketPricesError,
+    bins_plausible_for_forecast,
     calculate_edge,
+    effective_forecast_std,
     forecast_to_probabilities,
+    is_model_market_conflict,
     kelly_fraction,
     normalise_market_probs,
     recommended_bet_usd,
@@ -298,6 +301,15 @@ def _resolve_market_price(
         return book.mid_price, integrity["multiplier"], depth_usd
 
     if isinstance(book, dict):
+        # A synthetic book (midpoint-derived, fabricated spread/depth) carries a
+        # real price but invented depth.  When live data is required, treat it as
+        # no live book so the bin is skipped; otherwise use its real midpoint but
+        # report zero depth so slippage falls back to the volume heuristic instead
+        # of trusting fabricated levels.
+        is_synthetic = bool(book.get("synthetic"))
+        if is_synthetic and require_live:
+            return gamma_price, no_book_multiplier, 0.0
+
         integrity = check_midpoint_integrity(book.get("bids"), book.get("asks"))
         # Use provided 'mid' or calculate from levels
         mid = book.get("mid")
@@ -307,7 +319,10 @@ def _resolve_market_price(
                 if book.get("bids") and book.get("asks")
                 else gamma_price
             )
-        
+
+        if is_synthetic:
+            return mid, integrity["multiplier"], 0.0
+
         asks = book.get("asks") or []
         depth_usd = sum(a[0] * a[1] for a in asks if len(a) >= 2)
         return mid, integrity["multiplier"], depth_usd
@@ -436,23 +451,40 @@ def _process_market(
         detail["skip_reason"] = "missing standard deviation"
         return [], detail
 
-    _DEFAULT_STD_DEGRADATION = 0.15  # °C/day — matches StationBias.lead_time_degradation
-
     if calibration and target_date:
         mean = apply_calibration(
             raw_mean, calibration, target_date,
             metric=market.metric or "tmax",
         )
         std = apply_calibration_std(raw_std, calibration, lead_time_days=lead_time_days)
+        # The calibrated std already includes station-specific lead-time
+        # degradation; add only the irreducible model-error inflation + floor.
+        std = effective_forecast_std(std, lead_time_days=0)
         detail["calibration_applied"] = True
         detail["raw_mean"] = raw_mean
         detail["calibrated_mean"] = mean
     else:
         mean = raw_mean
-        std = raw_std
-        if lead_time_days > 1:
-            std += _DEFAULT_STD_DEGRADATION * (lead_time_days - 1)
+        # Betting-grade uncertainty: ensemble spread ⊕ model error ⊕ lead-time
+        # growth, floored — so a deceptively tight ensemble cannot manufacture a
+        # near-degenerate distribution and ~100% bin probabilities.
+        std = effective_forecast_std(raw_std, lead_time_days=lead_time_days)
         detail["calibration_applied"] = False
+
+    detail["betting_std"] = round(std, 3)
+
+    # ── Unit-mismatch guard ───────────────────────────────────────────
+    # If the bins are implausibly far from the forecast mean (e.g. Fahrenheit
+    # thresholds scored against a Celsius forecast), the normal CDF fabricates a
+    # ~100% cold-tail probability and phantom edge.  Skip the whole market.
+    if not bins_plausible_for_forecast(bins, mean):
+        logger.warning(
+            "Skipping market %s: bins %s implausible for forecast mean %.1f°C "
+            "(likely a unit-mismatch or bin-parse error).",
+            market.condition_id, bins, mean,
+        )
+        detail["skip_reason"] = "bins implausible for forecast (unit mismatch?)"
+        return [], detail
 
     # ── Model probabilities ───────────────────────────────────────────
     model_probs = forecast_to_probabilities(mean, std, bins)
@@ -525,16 +557,33 @@ def _process_market(
         # the preliminary edge was calculated, causing the threshold check
         # to use a different price than the refined edge calculation.
         mkt_p, integrity_multiplier, ask_depth_usd = _resolve_market_price(
-            i, market, orderbooks, require_live=require_live
+            i, market, orderbooks,
+            require_live=require_live or TRADING.require_live_orderbook,
         )
 
-        if mkt_p < 0.05:
+        if mkt_p < TRADING.min_market_price:
             logger.warning(
                 "BLOCKED LOW-PRICE: market=%s station=%s bin=%d mkt_p=%.4f bins=%s "
                 "forecast_mean=%.2f forecast_std=%.2f model_prob=%.4f bins_source=%s",
                 market.condition_id, market.station_id, i, mkt_p, bins, mean, std, mp,
                 "market.bins" if market.bins else "fallback:parse_bins_from_outcomes",
             )
+            continue
+
+        # ── Model-sanity veto ─────────────────────────────────────────
+        # If our model is near-certain about this bin but a *liquid* market
+        # prices it as very unlikely, the model is the outlier — skip rather
+        # than book the disagreement as edge.  This is the guard that would
+        # have prevented both circuit-breaker blowups (model ~100% vs a 6–15%
+        # market that was right every time).
+        if is_model_market_conflict(mp, mkt_p, market.volume):
+            logger.warning(
+                "MODEL-MARKET CONFLICT: market=%s station=%s bin=%d model_prob=%.3f "
+                "mkt_p=%.3f volume=%.0f — skipping suspected model fault, not edge.",
+                market.condition_id, market.station_id, i, mp, mkt_p, market.volume,
+            )
+            detail.setdefault("model_market_conflicts", 0)
+            detail["model_market_conflicts"] += 1
             continue
 
         combined_multiplier = regime_assessment.confidence_multiplier * integrity_multiplier
@@ -548,12 +597,17 @@ def _process_market(
             )
             continue
 
+        # Edge haircut: while the model is unproven, treat only a fraction of the
+        # estimated edge as real (Risk Manager: "assume the true edge is 50% of
+        # estimated").  Applied consistently to threshold checks and sizing.
+        haircut = TRADING.edge_uncertainty_haircut
+
         # Pass 1: fast rejection with 1%-bankroll slippage proxy.
         preliminary_slip = estimate_slippage(
             bet_size_usd=bankroll * 0.01,
             market_volume=market.volume,
         )
-        if calculate_edge(mp, mkt_p, dynamic_slippage=preliminary_slip) < edge_threshold:
+        if calculate_edge(mp, mkt_p, dynamic_slippage=preliminary_slip) * haircut < edge_threshold:
             continue
 
         # Pass 2: refine slippage using a realistic rough bet cap, then recheck.
@@ -569,7 +623,7 @@ def _process_market(
                 else None
             ),
         )
-        refined_edge = calculate_edge(mp, mkt_p, dynamic_slippage=dyn_slippage)
+        refined_edge = calculate_edge(mp, mkt_p, dynamic_slippage=dyn_slippage) * haircut
         if refined_edge < edge_threshold:
             continue
 

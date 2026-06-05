@@ -31,16 +31,18 @@ def forecast_to_probabilities(
     bins: list of (low, high) tuples, e.g.
           [(-inf, 18), (18, 20), (20, 22), (22, 24), (24, inf)]
     """
-    # FIX #3: 0.01 is absurdly tight — a 1°C std dev is the minimum
-    # sensible value for a temperature forecast. 0.01 produces near-certain
+    # FIX #3: 0.01 is absurdly tight — a degenerate std produces near-certain
     # probabilities and wildly inflated edges for any bin containing the mean.
+    # NOTE: callers that bet on these probabilities should pass a std that has
+    # already been widened via ``effective_forecast_std``; this clamp is only a
+    # last-resort guard against a non-positive value.
     if forecast_std <= 0:
         log.warning(
             "forecast_to_probabilities: forecast_std=%s is invalid; "
-            "clamping to 1.0°C minimum to avoid degenerate distribution.",
-            forecast_std,
+            "clamping to %.1f°C minimum to avoid degenerate distribution.",
+            forecast_std, TRADING.forecast_std_floor,
         )
-        forecast_std = 1.0
+        forecast_std = TRADING.forecast_std_floor
 
     distribution = stats.norm(loc=forecast_mean, scale=forecast_std)
     probabilities: list[float] = []
@@ -55,6 +57,106 @@ def forecast_to_probabilities(
         probabilities.append(max(prob, 0.0))
 
     return probabilities
+
+
+# =========================================================================
+# Betting-grade uncertainty + sanity guards
+# =========================================================================
+
+def effective_forecast_std(
+    ensemble_std: float,
+    lead_time_days: int = 0,
+    *,
+    model_error_std: float | None = None,
+    per_day: float | None = None,
+    floor: float | None = None,
+) -> float:
+    """
+    Widen a raw ensemble std into a betting-grade uncertainty.
+
+    The raw ECMWF ensemble spread is systematically too tight to bet on — it
+    repeatedly produced ~100% bin probabilities on outcomes that lost (both
+    circuit-breaker blowups).  We combine three independent error sources in
+    quadrature and floor the result so a deceptively narrow ensemble can never
+    again yield a near-degenerate distribution:
+
+        sqrt(ensemble_std² + model_error_std² + (per_day · lead_time_days)²)
+
+    floored at ``forecast_std_floor``.
+
+    Defaults are read from ``TRADING`` so they stay in one place.
+    """
+    model_error_std = TRADING.model_error_std if model_error_std is None else model_error_std
+    per_day = TRADING.lead_time_std_per_day if per_day is None else per_day
+    floor = TRADING.forecast_std_floor if floor is None else floor
+
+    base = max(ensemble_std or 0.0, 0.0)
+    lead = max(lead_time_days, 0) * per_day
+    inflated = math.sqrt(base * base + model_error_std * model_error_std + lead * lead)
+    return max(inflated, floor)
+
+
+def is_model_market_conflict(
+    model_prob: float,
+    market_prob: float,
+    market_volume: float,
+    *,
+    model_prob_max: float | None = None,
+    market_prob_min: float | None = None,
+    min_volume_usd: float | None = None,
+) -> bool:
+    """
+    Detect the failure mode behind both circuit-breaker blowups: the model is
+    near-certain about a bin that a *liquid* market prices as very unlikely.
+
+    When a market with real volume disagrees this strongly with the model, the
+    model is far more likely to be wrong (stale forecast, unit/bin error, bias)
+    than the market.  Callers should treat a ``True`` result as a suspected
+    model fault and skip the bin rather than booking the disagreement as edge.
+
+    Illiquid markets are exempt (``market_volume < min_volume_usd``) because a
+    thin market's price is not trustworthy enough to override the model.
+    """
+    model_prob_max = TRADING.sanity_model_prob_max if model_prob_max is None else model_prob_max
+    market_prob_min = TRADING.sanity_market_prob_min if market_prob_min is None else market_prob_min
+    min_volume_usd = TRADING.sanity_min_volume_usd if min_volume_usd is None else min_volume_usd
+
+    if market_volume < min_volume_usd:
+        return False
+    return model_prob >= model_prob_max and market_prob <= market_prob_min
+
+
+def bins_plausible_for_forecast(
+    bins: list[tuple[float, float]],
+    forecast_mean: float,
+    *,
+    max_offset_c: float = 25.0,
+) -> bool:
+    """
+    Guard against unit-mismatched bins (Fahrenheit thresholds scored against a
+    Celsius forecast).  When 70–90°F bins are compared to a ~24°C mean, the
+    normal CDF dumps ~100% of the mass into the cold-tail bin and fabricates an
+    enormous edge — the signature of the March blowup.
+
+    Returns ``False`` when the Celsius forecast mean sits more than
+    ``max_offset_c`` below the lowest finite bin edge (or above the highest),
+    which is physically implausible for a correctly unit-matched market.  A
+    legitimate cold/warm day stays comfortably inside this generous window.
+    """
+    finite_edges = [
+        e
+        for lo, hi in bins
+        for e in (lo, hi)
+        if e not in (float("-inf"), float("inf"))
+    ]
+    if not finite_edges:
+        return True  # nothing to compare against (e.g. pure YES/NO)
+
+    if forecast_mean < min(finite_edges) - max_offset_c:
+        return False
+    if forecast_mean > max(finite_edges) + max_offset_c:
+        return False
+    return True
 
 
 # =========================================================================

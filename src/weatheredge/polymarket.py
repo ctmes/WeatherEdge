@@ -748,11 +748,16 @@ async def enrich_markets_with_live_prices(
             if mid is not None and 0.0 < mid < 1.0:
                 new_prices.append(mid)
                 any_live = True
-                # Build a minimal synthetic orderbook so the integrity filter has data
+                # Build a minimal synthetic orderbook so the integrity filter has
+                # data.  The midpoint itself is a real CLOB price, but the spread
+                # and depth here are fabricated — flag it so downstream slippage
+                # does not trust the invented depth and so a `require_live_orderbook`
+                # policy can reject it.
                 half_spread = 0.005
                 orderbooks[tid] = {
                     "bids": [[mid - half_spread, 100]],
                     "asks": [[mid + half_spread, 100]],
+                    "synthetic": True,
                 }
             else:
                 fallback = m.outcome_prices[idx] if idx < len(m.outcome_prices) else 0.0
