@@ -1,29 +1,30 @@
 """
-Rewards-economics evaluator — answers ONE question before we build any
-market-making infrastructure: at a small bankroll, is farming Polymarket's
-liquidity-rewards program on weather markets actually worth it?
+Rewards-economics evaluator — answers the ONLY question that matters before we
+build any market-making code: at a $1k bankroll, what is your *realistic* share
+of Polymarket's weather liquidity-reward pools, and what does that pay per month?
 
-It is strictly READ-ONLY. It places no orders and needs no API key/wallet.
+Strictly READ-ONLY. Places no orders, needs no API key/wallet.
 
-What it does
-------------
-1. Pulls the markets Polymarket is currently paying liquidity rewards on
-   (CLOB ``/sampling-markets`` returns reward-eligible markets only).
-2. Filters to weather / temperature markets.
-3. For each, prints the reward parameters (daily rate, min order size,
-   max qualifying spread) and the current top-of-book spread.
-4. Computes the decision number: to hit a monthly income target, what
-   fraction of each market's daily reward pool would you have to capture?
-   That share is something you can sanity-check by eye — if you'd need to
-   win 60% of a pool that bigger makers are also farming, MM is not your edge.
+Two stages
+----------
+STAGE 1 (pool size):   CLOB /sampling-markets lists reward-eligible markets and
+                       their daily reward pool. We filter to weather/temperature.
+STAGE 2 (your share):  For the fattest pools we pull the LIVE order book and
+                       measure how much *competing* maker liquidity is already
+                       resting within the reward spread band of the midpoint.
+                       Your share ≈ your_size / (your_size + competing_size),
+                       which turns the pool into a realistic $/day and $/month.
 
-Run it ON THE VPS (Singapore reaches Polymarket):
-    python -m scripts.eval_rewards            # defaults: $1000 bankroll, $300/mo target
-    python -m scripts.eval_rewards --bankroll 1000 --monthly-target 300
+The share model is a deliberate first-order proxy. Polymarket's true reward
+formula also weights proximity-to-mid and time, and requires two-sided quoting —
+so treat the output as an UPPER-ish bound on income and a sanity check, not a
+guarantee. It does NOT model toxic-fill losses (informed traders picking off
+your resting orders), which are the other half of net P&L.
 
-NOTE ON SCHEMA: the CLOB rewards block field names have shifted across API
-versions. This script tries the known variants and, if it can't find a rate,
-prints the raw ``rewards`` JSON so you can paste it back and we refine the parser.
+Run on the VPS (Singapore reaches Polymarket):
+    python -m scripts.eval_rewards
+    python -m scripts.eval_rewards --bankroll 1000 --monthly-target 300 \
+                                   --per-market 50 --top 25 --spread-units cents
 """
 
 from __future__ import annotations
@@ -31,16 +32,27 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import re
 from typing import Any
 
-from weatheredge.config import POLYMARKET_CLOB_BASE, WEATHER_KEYWORDS, NON_WEATHER_BLOCKLIST
+from weatheredge.config import POLYMARKET_CLOB_BASE, NON_WEATHER_BLOCKLIST
 from weatheredge.polymarket import _get_json
 
 log = logging.getLogger("eval_rewards")
 
+# Tight weather match on the QUESTION text only (description/slug leaked
+# false-positives like "Rainbow Six" via the substring "rain"). Whole-word
+# weather terms + degree symbols.
+_WEATHER_RE = re.compile(
+    r"(°\s*[cf]\b|\b(temperature|celsius|fahrenheit|rainfall|snowfall|"
+    r"precipitation|hurricane|tornado|cyclone|blizzard|heatwave|sea ice|"
+    r"hottest|coldest|frost)\b)",
+    re.IGNORECASE,
+)
+
 
 # ---------------------------------------------------------------------------
-# Fetch reward-eligible markets
+# Stage 1: reward-eligible markets
 # ---------------------------------------------------------------------------
 
 async def _fetch_sampling_markets(max_pages: int = 20) -> list[dict[str, Any]]:
@@ -59,165 +71,187 @@ async def _fetch_sampling_markets(max_pages: int = 20) -> list[dict[str, Any]]:
         batch = data.get("data", [])
         markets.extend(batch)
         cursor = data.get("next_cursor", "") or ""
-        if not cursor or cursor == "LTE=" or not batch:  # "LTE=" = end sentinel
+        if not cursor or cursor == "LTE=" or not batch:
             break
     return markets
 
 
 def _is_weather(market: dict[str, Any]) -> bool:
-    text = " ".join(
-        str(market.get(k, "")) for k in ("question", "description", "market_slug")
-    ).lower()
-    if any(bl in text for bl in NON_WEATHER_BLOCKLIST):
+    q = str(market.get("question", ""))
+    if any(bl in q.lower() for bl in NON_WEATHER_BLOCKLIST):
         return False
-    return any(kw in text for kw in WEATHER_KEYWORDS)
+    return bool(_WEATHER_RE.search(q))
 
-
-# ---------------------------------------------------------------------------
-# Reward-block parsing (tolerant of schema drift)
-# ---------------------------------------------------------------------------
 
 def _parse_rewards(market: dict[str, Any]) -> dict[str, Any] | None:
-    """
-    Extract (daily_rate_usd, min_size, max_spread) from a market's rewards block.
-
-    ``daily_rate`` is 0.0 when the market is reward-*eligible* (has min_size /
-    max_spread configured) but ``rates`` is null/empty — i.e. no pool is being
-    paid right now.  Returns None only when there is no rewards block at all.
-    """
+    """Extract daily_rate (0.0 if rates null/empty), min_size, max_spread."""
     rw = market.get("rewards")
     if not isinstance(rw, dict):
         return None
-
-    # daily rate may live under several shapes; rates can also be None/empty.
     daily_rate = 0.0
     rates = rw.get("rates")
     if isinstance(rates, list):
         for r in rates:
-            if not isinstance(r, dict):
-                continue
-            for key in ("rewards_daily_rate", "rewardsDailyRate", "daily_rate", "rate"):
-                if r.get(key) is not None:
-                    daily_rate += float(r[key])
-                    break
+            if isinstance(r, dict):
+                for key in ("rewards_daily_rate", "rewardsDailyRate", "daily_rate", "rate"):
+                    if r.get(key) is not None:
+                        daily_rate += float(r[key])
+                        break
     if not daily_rate:
         for key in ("rewards_daily_rate", "rewardsDailyRate", "daily_rate"):
             if rw.get(key) is not None:
                 daily_rate = float(rw[key])
                 break
-
     min_size = rw.get("min_size") or rw.get("minSize") or rw.get("min_order_size")
     max_spread = rw.get("max_spread") or rw.get("maxSpread")
-
     return {
         "daily_rate": daily_rate,
         "min_size": float(min_size) if min_size is not None else None,
         "max_spread": float(max_spread) if max_spread is not None else None,
-        "raw": rw,
     }
+
+
+def _first_token_id(market: dict[str, Any]) -> str | None:
+    toks = market.get("tokens") or []
+    for t in toks:
+        tid = str(t.get("token_id", "")).strip() if isinstance(t, dict) else ""
+        if tid:
+            return tid
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: live order book → competing in-band liquidity
+# ---------------------------------------------------------------------------
+
+async def _fetch_book(token_id: str) -> dict[str, Any] | None:
+    try:
+        return await _get_json(f"{POLYMARKET_CLOB_BASE}/book", {"token_id": token_id})
+    except Exception as e:
+        log.debug("book fetch failed for %s: %s", token_id, e)
+        return None
+
+
+def _competing_in_band_usd(book: dict[str, Any], band: float) -> tuple[float, float] | None:
+    """
+    Return (mid, competing_usd) — total resting maker notional within `band`
+    (price units) of the midpoint, summed over both bid and ask sides.
+    """
+    def _levels(side):
+        out = []
+        for lvl in book.get(side, []) or []:
+            try:
+                out.append((float(lvl["price"]), float(lvl["size"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return out
+
+    bids = sorted(_levels("bids"), key=lambda x: x[0], reverse=True)
+    asks = sorted(_levels("asks"), key=lambda x: x[0])
+    if not bids or not asks:
+        return None
+    mid = (bids[0][0] + asks[0][0]) / 2.0
+
+    usd = 0.0
+    for price, size in bids:
+        if price >= mid - band:
+            usd += price * size
+    for price, size in asks:
+        if price <= mid + band:
+            usd += price * size
+    return mid, usd
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-async def main(bankroll: float, monthly_target: float) -> None:
+async def main(args) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    markets = await _fetch_sampling_markets()
-    log.info("Reward-eligible markets returned by CLOB: %d", len(markets))
+    sampling = await _fetch_sampling_markets()
+    weather = [m for m in sampling if _is_weather(m)]
+    log.info("Reward-eligible markets: %d  |  weather (tight filter): %d",
+             len(sampling), len(weather))
 
-    weather = [m for m in markets if _is_weather(m)]
-    log.info("Weather/temperature markets among them: %d\n", len(weather))
-
-    if not weather:
-        log.info(
-            "No reward-eligible WEATHER markets right now. Either none are in the "
-            "rewards program currently, or the sampling endpoint/schema changed.\n"
-            "Re-run later, or paste me the raw output if you expected some."
-        )
-        # Still show whether ANY rewards exist so we know the endpoint works.
-        log.info("(For reference, %d non-weather reward markets exist.)", len(markets) - len(weather))
-        return
-
-    daily_target = monthly_target / 30.0
-    rows: list[dict[str, Any]] = []
-    inactive = 0     # reward-eligible but paying $0 right now (rates: None/empty)
-    no_block = 0     # no rewards block at all
-    total_pool = 0.0
-
+    active: list[dict[str, Any]] = []
     for m in weather:
-        parsed = _parse_rewards(m)
-        q = (m.get("question") or m.get("market_slug") or "?")[:50]
-        if parsed is None:
-            no_block += 1
+        p = _parse_rewards(m)
+        if not p or p["daily_rate"] <= 0:
             continue
-        rate = parsed["daily_rate"]
-        if rate <= 0:
-            inactive += 1
+        tid = _first_token_id(m)
+        if not tid:
             continue
-        total_pool += rate
-        rows.append({
-            "rate": rate,
-            "req_share": daily_target / rate * 100.0,
-            "min_size": parsed["min_size"],
-            "max_spread": parsed["max_spread"],
-            "q": q,
+        active.append({
+            "q": (m.get("question") or "?")[:46],
+            "rate": p["daily_rate"],
+            "min_size": p["min_size"],
+            "max_spread": p["max_spread"],
+            "token_id": tid,
         })
 
-    # None-safe sort: rank by daily rate only.
-    rows.sort(key=lambda r: r["rate"], reverse=True)
+    active.sort(key=lambda r: r["rate"], reverse=True)
+    total_pool = sum(r["rate"] for r in active)
+    log.info("Active weather pools: %d markets, $%.0f/day ($%.0f/mo) total\n",
+             len(active), total_pool, total_pool * 30)
 
-    log.info(
-        "Eligible weather markets: %d  |  ACTIVELY paying a rate: %d  |  "
-        "eligible but $0 (rates:null): %d  |  no rewards block: %d\n",
-        len(weather), len(rows), inactive, no_block,
-    )
+    top = active[: args.top]
+    your_usd = args.per_market * 2.0  # two-sided
+    spread_div = 100.0 if args.spread_units == "cents" else 1.0
 
-    if not rows:
-        log.info(
-            "VERDICT: zero weather markets are currently paying a liquidity-reward "
-            "rate. Market-making rewards on weather is NOT an income path right now — "
-            "every eligible market shows rates:null (a $0 pool).\n"
-            "Re-run on another day to confirm it's not just a quiet window."
-        )
-        return
-
-    log.info("%-52s %9s %9s %9s %10s", "MARKET", "POOL/day", "min_size", "max_spr", "share->tgt")
+    log.info("Stage 2 — measuring competing liquidity in the reward band for top %d pools", len(top))
+    log.info("(your stake per market: $%.0f two-sided)\n", your_usd)
+    log.info("%-46s %8s %9s %8s %9s %9s", "MARKET", "POOL/d", "compet$", "share%", "you/day", "you/mo")
     log.info("-" * 95)
-    for r in rows:
+
+    results = []
+    for r in top:
+        band = (r["max_spread"] or 0.0) / spread_div
+        book = await _fetch_book(r["token_id"])
+        if not book or band <= 0:
+            log.info("%-46s %7.0f$ %9s %8s %9s %9s", r["q"], r["rate"], "no book", "-", "-", "-")
+            continue
+        comp = _competing_in_band_usd(book, band)
+        if comp is None:
+            log.info("%-46s %7.0f$ %9s %8s %9s %9s", r["q"], r["rate"], "empty", "-", "-", "-")
+            continue
+        _mid, competing_usd = comp
+        share = your_usd / (competing_usd + your_usd)
+        you_day = share * r["rate"]
+        results.append(you_day)
         log.info(
-            "%-52s %8.2f$ %9s %9s %9.1f%%",
-            r["q"], r["rate"],
-            f"{r['min_size']:.0f}" if r["min_size"] is not None else "?",
-            f"{r['max_spread']:.2f}" if r["max_spread"] is not None else "?",
-            r["req_share"],
+            "%-46s %7.0f$ %8.0f$ %7.1f%% %8.2f$ %8.2f$",
+            r["q"], r["rate"], competing_usd, share * 100, you_day, you_day * 30,
         )
 
     log.info("-" * 95)
+
+    # Realistic total: you can only fund floor(bankroll / your_usd) markets at once.
+    fundable = max(1, int(args.bankroll // your_usd)) if your_usd > 0 else 0
+    results.sort(reverse=True)
+    realistic_day = sum(results[:fundable])
     log.info(
-        "\nTotal weather reward pool (active only): $%.2f/day  ($%.0f/mo) across %d markets",
-        total_pool, total_pool * 30, len(rows),
-    )
-    pool_share_needed = daily_target / total_pool * 100.0
-    log.info(
-        "To earn $%.0f/mo you must capture %.1f%% of the ENTIRE active weather "
-        "reward pool, every day, across all these markets.",
-        monthly_target, pool_share_needed,
+        "\nYour $%.0f funds ~%d markets two-sided at $%.0f each.",
+        args.bankroll, fundable, your_usd,
     )
     log.info(
-        "Your $%.0f bankroll can rest at most ~$%.0f of qualifying size at once "
-        "(split two-sided) — eyeball whether that realistically wins the share above\n"
-        "against makers quoting far larger size.",
-        bankroll, bankroll,
+        "Realistic reward income (best %d of the measured pools): $%.2f/day  ->  $%.0f/month",
+        fundable, realistic_day, realistic_day * 30,
     )
-    if no_block:
-        log.info("\n(%d markets had no rewards block — schema may have shifted; tell me if that's most of them.)", no_block)
+    log.info(
+        "\nReality checks NOT in this number:\n"
+        "  - This is gross rewards; subtract losses to toxic fills (informed flow).\n"
+        "  - Assumes you actually hold qualifying two-sided quotes ~100%% of the time.\n"
+        "  - Share model ignores Polymarket's proximity/time weighting (optimistic)."
+    )
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Evaluate Polymarket liquidity-reward economics for weather markets.")
-    ap.add_argument("--bankroll", type=float, default=1000.0, help="Working capital in USD (default 1000)")
-    ap.add_argument("--monthly-target", type=float, default=300.0, help="Income target in USD/month (default 300)")
-    args = ap.parse_args()
-    asyncio.run(main(args.bankroll, args.monthly_target))
+    ap = argparse.ArgumentParser(description="Evaluate Polymarket weather liquidity-reward economics + realistic share.")
+    ap.add_argument("--bankroll", type=float, default=1000.0)
+    ap.add_argument("--monthly-target", type=float, default=300.0)
+    ap.add_argument("--per-market", type=float, default=50.0, help="USD rested per side, per market")
+    ap.add_argument("--top", type=int, default=25, help="How many of the fattest pools to measure books for")
+    ap.add_argument("--spread-units", choices=["cents", "price"], default="cents",
+                    help="Units of max_spread from the API (4.5 → 0.045 if cents)")
+    asyncio.run(main(ap.parse_args()))
