@@ -79,15 +79,17 @@ def _is_weather(market: dict[str, Any]) -> bool:
 
 def _parse_rewards(market: dict[str, Any]) -> dict[str, Any] | None:
     """
-    Extract (daily_rate_usd, min_size, max_spread) from a market's rewards block,
-    tolerating the field-name variants seen across CLOB API versions.
-    Returns None (and the caller prints the raw block) if no rate is found.
+    Extract (daily_rate_usd, min_size, max_spread) from a market's rewards block.
+
+    ``daily_rate`` is 0.0 when the market is reward-*eligible* (has min_size /
+    max_spread configured) but ``rates`` is null/empty — i.e. no pool is being
+    paid right now.  Returns None only when there is no rewards block at all.
     """
-    rw = market.get("rewards") or {}
+    rw = market.get("rewards")
     if not isinstance(rw, dict):
         return None
 
-    # daily rate may live under several shapes
+    # daily rate may live under several shapes; rates can also be None/empty.
     daily_rate = 0.0
     rates = rw.get("rates")
     if isinstance(rates, list):
@@ -98,16 +100,15 @@ def _parse_rewards(market: dict[str, Any]) -> dict[str, Any] | None:
                 if r.get(key) is not None:
                     daily_rate += float(r[key])
                     break
-    for key in ("rewards_daily_rate", "rewardsDailyRate", "daily_rate"):
-        if not daily_rate and rw.get(key) is not None:
-            daily_rate = float(rw[key])
-            break
+    if not daily_rate:
+        for key in ("rewards_daily_rate", "rewardsDailyRate", "daily_rate"):
+            if rw.get(key) is not None:
+                daily_rate = float(rw[key])
+                break
 
     min_size = rw.get("min_size") or rw.get("minSize") or rw.get("min_order_size")
     max_spread = rw.get("max_spread") or rw.get("maxSpread")
 
-    if daily_rate <= 0:
-        return None
     return {
         "daily_rate": daily_rate,
         "min_size": float(min_size) if min_size is not None else None,
@@ -140,55 +141,78 @@ async def main(bankroll: float, monthly_target: float) -> None:
         return
 
     daily_target = monthly_target / 30.0
-    rows: list[tuple] = []
+    rows: list[dict[str, Any]] = []
+    inactive = 0     # reward-eligible but paying $0 right now (rates: None/empty)
+    no_block = 0     # no rewards block at all
     total_pool = 0.0
-    unparsed = 0
 
     for m in weather:
         parsed = _parse_rewards(m)
         q = (m.get("question") or m.get("market_slug") or "?")[:50]
         if parsed is None:
-            unparsed += 1
-            log.info("  [no parseable rate] %s\n    raw rewards: %s", q, m.get("rewards"))
+            no_block += 1
             continue
         rate = parsed["daily_rate"]
+        if rate <= 0:
+            inactive += 1
+            continue
         total_pool += rate
-        # Required share of THIS market's pool to hit the whole daily target alone.
-        req_share = (daily_target / rate * 100.0) if rate > 0 else float("inf")
-        rows.append((rate, req_share, parsed["min_size"], parsed["max_spread"], q))
+        rows.append({
+            "rate": rate,
+            "req_share": daily_target / rate * 100.0,
+            "min_size": parsed["min_size"],
+            "max_spread": parsed["max_spread"],
+            "q": q,
+        })
 
-    rows.sort(reverse=True)
+    # None-safe sort: rank by daily rate only.
+    rows.sort(key=lambda r: r["rate"], reverse=True)
 
-    log.info("%-52s %9s %9s %9s %10s", "MARKET", "POOL/day", "min_size", "max_spr", "share→tgt")
+    log.info(
+        "Eligible weather markets: %d  |  ACTIVELY paying a rate: %d  |  "
+        "eligible but $0 (rates:null): %d  |  no rewards block: %d\n",
+        len(weather), len(rows), inactive, no_block,
+    )
+
+    if not rows:
+        log.info(
+            "VERDICT: zero weather markets are currently paying a liquidity-reward "
+            "rate. Market-making rewards on weather is NOT an income path right now — "
+            "every eligible market shows rates:null (a $0 pool).\n"
+            "Re-run on another day to confirm it's not just a quiet window."
+        )
+        return
+
+    log.info("%-52s %9s %9s %9s %10s", "MARKET", "POOL/day", "min_size", "max_spr", "share->tgt")
     log.info("-" * 95)
-    for rate, req_share, min_size, max_spread, q in rows:
+    for r in rows:
         log.info(
             "%-52s %8.2f$ %9s %9s %9.1f%%",
-            q, rate,
-            f"{min_size:.0f}" if min_size is not None else "?",
-            f"{max_spread:.2f}" if max_spread is not None else "?",
-            req_share,
+            r["q"], r["rate"],
+            f"{r['min_size']:.0f}" if r["min_size"] is not None else "?",
+            f"{r['max_spread']:.2f}" if r["max_spread"] is not None else "?",
+            r["req_share"],
         )
 
     log.info("-" * 95)
     log.info(
-        "\nTotal weather reward pool: $%.2f/day  ($%.0f/mo) across %d markets",
+        "\nTotal weather reward pool (active only): $%.2f/day  ($%.0f/mo) across %d markets",
         total_pool, total_pool * 30, len(rows),
     )
-    if total_pool > 0:
-        pool_share_needed = daily_target / total_pool * 100.0
-        log.info(
-            "To earn $%.0f/mo from rewards you must capture %.1f%% of the ENTIRE "
-            "weather reward pool (every day, across all these markets).",
-            monthly_target, pool_share_needed,
-        )
-        log.info(
-            "Your $%.0f bankroll can rest at most ~$%.0f of qualifying size at once, "
-            "split two-sided across markets — eyeball whether that wins the share above.",
-            bankroll, bankroll,
-        )
-    if unparsed:
-        log.info("\n(%d markets had a rewards block I couldn't parse — raw JSON printed above.)", unparsed)
+    pool_share_needed = daily_target / total_pool * 100.0
+    log.info(
+        "To earn $%.0f/mo you must capture %.1f%% of the ENTIRE active weather "
+        "reward pool, every day, across all these markets.",
+        monthly_target, pool_share_needed,
+    )
+    log.info(
+        "Your $%.0f bankroll can rest at most ~$%.0f of qualifying size at once "
+        "(split two-sided) — eyeball whether that realistically wins the share above\n"
+        "against makers quoting far larger size.",
+        bankroll, bankroll,
+    )
+    if no_block:
+        log.info("\n(%d markets had no rewards block — schema may have shifted; tell me if that's most of them.)", no_block)
 
 
 if __name__ == "__main__":
