@@ -135,15 +135,36 @@ def _mid_from_book(data: Any) -> float | None:
     return None
 
 
+def _download_to_temp(url: str, timeout: int = 240) -> str:
+    """Stream a remote Parquet to a temp file using ~1 MB of RAM. Returns the path."""
+    import os
+    import tempfile
+    import httpx
+
+    fd, tmp = tempfile.mkstemp(suffix=".parquet")
+    with os.fdopen(fd, "wb") as f:
+        with httpx.stream("GET", url, timeout=timeout, follow_redirects=True) as resp:
+            resp.raise_for_status()
+            for chunk in resp.iter_bytes(chunk_size=1 << 20):
+                f.write(chunk)
+    return tmp
+
+
 def load_price_paths(token_ids: list[str], day: date, hours: range) -> dict[str, list[tuple[int, float]]]:
     """
     Build intraday ``{token_id: [(ts_ms, mid), ...]}`` paths for several tokens
     at once. Each hourly pmxt Parquet (hundreds of MB) is downloaded ONCE and
     filtered for all tokens — never re-downloaded per token.
+
+    Memory-safe for small (≈1 GB) hosts: the file is streamed to disk, then read
+    with Polars' LAZY engine so the filter + column projection are pushed down and
+    only the handful of matching rows ever materialise in RAM (a full read of
+    these files OOM-kills a 1 GB droplet).
     """
+    import os
     import polars as pl
     from weatheredge.config import PMXT_ARCHIVE_BASE
-    from weatheredge.pmxt_fetcher import _download_parquet, _normalize_id
+    from weatheredge.pmxt_fetcher import _normalize_id
 
     norm_to_orig = {_normalize_id(t): t for t in token_ids}
     norms = list(norm_to_orig.keys())
@@ -152,13 +173,34 @@ def load_price_paths(token_ids: list[str], day: date, hours: range) -> dict[str,
     for h in hours:
         url = f"{PMXT_ARCHIVE_BASE}/polymarket_orderbook_{day.isoformat()}T{h:02d}.parquet"
         try:
-            df = _download_parquet(url, columns=["market_id", "update_type", "timestamp_received", "data"])
+            tmp = _download_to_temp(url)
         except Exception as e:
-            log.warning("hour %02d: download failed (%s)", h, e)
+            log.warning("hour %02d: download failed (%s)", h, str(e).splitlines()[0])
             continue
-        sub = df.filter(
-            pl.col("market_id").is_in(norms) & (pl.col("update_type") == "book_snapshot")
-        ).with_columns(pl.col("timestamp_received").cast(pl.Int64).alias("_ts"))
+        try:
+            sub = (
+                pl.scan_parquet(tmp)
+                .filter(
+                    pl.col("market_id").is_in(norms)
+                    & (pl.col("update_type") == "book_snapshot")
+                )
+                .select(
+                    pl.col("market_id"),
+                    pl.col("timestamp_received").cast(pl.Int64).alias("_ts"),
+                    pl.col("data"),
+                )
+                .collect(streaming=True)
+            )
+        except Exception as e:
+            log.warning("hour %02d: parse failed (%s)", h, str(e).splitlines()[0])
+            os.unlink(tmp)
+            continue
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
         n = 0
         for row in sub.iter_rows(named=True):
             orig = norm_to_orig.get(row["market_id"])
