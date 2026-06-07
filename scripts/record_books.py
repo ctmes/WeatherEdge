@@ -94,71 +94,91 @@ async def main(args) -> None:
     log.info("Recording %d weather tokens (top pools: %s)",
              len(targets), ", ".join(f"${r['reward_per_day']:.0f}" for r in targets[:5]))
 
-    buf: list[dict] = []
+    books_buf: list[dict] = []   # full-depth book snapshots
+    trades_buf: list[dict] = []  # individual trade prints (if the feed emits them)
     last_at: dict[str, float] = {}
+
+    def _book_row(snap: OrderbookSnapshot, now_ms: int, src: str) -> dict:
+        """Full-depth snapshot row — enough to reconstruct the book for any backtest."""
+        n = args.depth_levels
+        return {
+            "ts": now_ms,
+            "token": snap.asset_id,
+            "bid": snap.best_bid,
+            "ask": snap.best_ask,
+            "mid": snap.mid_price,
+            "bids": [[lvl.price, lvl.size] for lvl in snap.bids[:n]],
+            "asks": [[lvl.price, lvl.size] for lvl in snap.asks[:n]],
+            "src": src,
+        }
 
     def on_book(snap) -> None:
         if not isinstance(snap, OrderbookSnapshot):
             return
-        mid = snap.mid_price
-        if not (0.0 < mid < 1.0):
+        if not (0.0 < snap.mid_price < 1.0):
             return
         now = time.time()
+        # Throttle event-driven captures per token (the heartbeat sampler covers gaps).
         if now - last_at.get(snap.asset_id, 0.0) < args.min_interval:
             return
         last_at[snap.asset_id] = now
-        buf.append({
-            "ts": int(now * 1000),
-            "token": snap.asset_id,
-            "bid": snap.best_bid,
-            "ask": snap.best_ask,
-            "mid": mid,
-        })
+        books_buf.append(_book_row(snap, int(now * 1000), "event"))
+
+    def on_trade(tr) -> None:
+        # Real trade prints upgrade the backtest from inferring fills to observing
+        # them. NOTE: Polymarket's market channel may not emit these — if trades_
+        # files stay empty, the feed simply doesn't carry trades on this channel.
+        try:
+            trades_buf.append({
+                "ts": int(time.time() * 1000),
+                "token": tr.asset_id,
+                "price": tr.price,
+                "size": tr.size,
+                "side": tr.side,
+            })
+        except Exception:
+            pass
 
     ws = WeatherEdgeMarketWS()
     ws.on_book_update = on_book
+    ws.on_trade = on_trade
     await ws.subscribe([r["token_id"] for r in targets])
 
-    def _flush() -> int:
+    def _flush_buf(buf: list[dict], prefix: str) -> int:
         if not buf:
             return 0
         chunk, buf[:] = buf[:], []
         day = _utcnow().strftime("%Y-%m-%d")
-        with (OUT_DIR / f"books_{day}.jsonl").open("a") as f:
+        with (OUT_DIR / f"{prefix}_{day}.jsonl").open("a") as f:
             for row in chunk:
                 f.write(json.dumps(row) + "\n")
         return len(chunk)
 
+    def _flush() -> tuple[int, int]:
+        return _flush_buf(books_buf, "books"), _flush_buf(trades_buf, "trades")
+
     async def flusher() -> None:
-        total = 0
+        tot_b = tot_t = 0
         while True:
             await asyncio.sleep(args.flush)
-            n = _flush()
-            if n:
-                total += n
-                log.info("flushed %d snapshots (session total %d)", n, total)
+            nb, nt = _flush()
+            if nb or nt:
+                tot_b += nb
+                tot_t += nt
+                log.info("flushed %d books, %d trades (session %d / %d)", nb, nt, tot_b, tot_t)
 
     async def sampler() -> None:
-        # Heartbeat: record each tracked token's current mid on a fixed timer,
-        # even when the book hasn't ticked. Weather books are quiet (≈1 update/min
-        # across all markets), so event-driven capture alone leaves gaps; this
-        # guarantees a regular, continuous price path for the toxic-fill sim.
+        # Heartbeat: snapshot each tracked token's full book on a fixed timer, even
+        # when it hasn't ticked. Weather books are quiet, so event-driven capture
+        # alone leaves gaps; this guarantees a regular, reconstructable series.
         while True:
             await asyncio.sleep(args.sample_interval)
             now_ms = int(time.time() * 1000)
-            n = 0
             for tid in list(known):
                 ob = ws._orderbooks.get(tid)
-                if ob is None:
+                if ob is None or not (0.0 < ob.mid_price < 1.0):
                     continue
-                mid = ob.mid_price
-                if not (0.0 < mid < 1.0):
-                    continue
-                buf.append({
-                    "ts": now_ms, "token": tid,
-                    "bid": ob.best_bid, "ask": ob.best_ask, "mid": mid, "src": "poll",
-                })
-                n += 1
+                books_buf.append(_book_row(ob, now_ms, "poll"))
 
     async def rediscover() -> None:
         while True:
@@ -183,15 +203,16 @@ async def main(args) -> None:
         pass
     finally:
         await ws.stop()
-        n = _flush()
-        log.info("Stopped. Final flush: %d snapshots.", n)
+        nb, nt = _flush()
+        log.info("Stopped. Final flush: %d books, %d trades.", nb, nt)
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Record live weather-market order books for the toxic-fill backtest.")
     ap.add_argument("--top", type=int, default=12, help="Number of fattest reward pools to record")
     ap.add_argument("--min-interval", type=float, default=5.0, help="Min seconds between event-driven snapshots per token")
-    ap.add_argument("--sample-interval", type=float, default=60.0, help="Seconds between fixed-timer mid samples per token (gap-free path)")
+    ap.add_argument("--sample-interval", type=float, default=60.0, help="Seconds between fixed-timer book snapshots per token (gap-free series)")
+    ap.add_argument("--depth-levels", type=int, default=20, help="Order-book levels per side to record")
     ap.add_argument("--flush", type=float, default=30.0, help="Seconds between disk flushes")
     ap.add_argument("--rediscover", type=float, default=6.0, help="Hours between re-discovering fresh markets")
     asyncio.run(main(ap.parse_args()))
