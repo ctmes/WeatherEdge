@@ -40,7 +40,11 @@ from scripts.eval_rewards import (
 from weatheredge.ws_client import WeatherEdgeMarketWS, OrderbookSnapshot
 
 log = logging.getLogger("record_books")
-OUT_DIR = Path("data/book_recordings")
+# Anchor to the repo root so the output folder is identical no matter which
+# directory the recorder is launched from. A relative path silently split the
+# data across ~/data and ~/WeatherEdge/data when started from different CWDs.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+OUT_DIR = _REPO_ROOT / "data" / "book_recordings"
 
 
 def _utcnow() -> datetime:
@@ -134,6 +138,28 @@ async def main(args) -> None:
                 total += n
                 log.info("flushed %d snapshots (session total %d)", n, total)
 
+    async def sampler() -> None:
+        # Heartbeat: record each tracked token's current mid on a fixed timer,
+        # even when the book hasn't ticked. Weather books are quiet (≈1 update/min
+        # across all markets), so event-driven capture alone leaves gaps; this
+        # guarantees a regular, continuous price path for the toxic-fill sim.
+        while True:
+            await asyncio.sleep(args.sample_interval)
+            now_ms = int(time.time() * 1000)
+            n = 0
+            for tid in list(known):
+                ob = ws._orderbooks.get(tid)
+                if ob is None:
+                    continue
+                mid = ob.mid_price
+                if not (0.0 < mid < 1.0):
+                    continue
+                buf.append({
+                    "ts": now_ms, "token": tid,
+                    "bid": ob.best_bid, "ask": ob.best_ask, "mid": mid, "src": "poll",
+                })
+                n += 1
+
     async def rediscover() -> None:
         while True:
             await asyncio.sleep(args.rediscover * 3600)
@@ -152,7 +178,7 @@ async def main(args) -> None:
 
     log.info("Recording... (Ctrl-C to stop; data in %s/)", OUT_DIR)
     try:
-        await asyncio.gather(ws.run(), flusher(), rediscover())
+        await asyncio.gather(ws.run(), flusher(), sampler(), rediscover())
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
@@ -164,7 +190,8 @@ async def main(args) -> None:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Record live weather-market order books for the toxic-fill backtest.")
     ap.add_argument("--top", type=int, default=12, help="Number of fattest reward pools to record")
-    ap.add_argument("--min-interval", type=float, default=5.0, help="Min seconds between snapshots per token")
+    ap.add_argument("--min-interval", type=float, default=5.0, help="Min seconds between event-driven snapshots per token")
+    ap.add_argument("--sample-interval", type=float, default=60.0, help="Seconds between fixed-timer mid samples per token (gap-free path)")
     ap.add_argument("--flush", type=float, default=30.0, help="Seconds between disk flushes")
     ap.add_argument("--rediscover", type=float, default=6.0, help="Hours between re-discovering fresh markets")
     asyncio.run(main(ap.parse_args()))
