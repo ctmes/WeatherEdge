@@ -1,0 +1,46 @@
+# WeatherEdge live order-book recorder — systemd unit
+#
+# Why this exists: tmux does NOT survive a reboot, and the droplet auto-reboots
+# for unattended security upgrades — which silently killed the recorder and cost
+# days of data. systemd restarts it on boot AND on crash, so collection survives
+# unattended for weeks.
+#
+# INSTALL (on the VPS):
+#   # stop any tmux/manual recorder first so there's only one writer
+#   tmux kill-server 2>/dev/null; pkill -f record_books
+#   sudo cp deploy/record-books.service /etc/systemd/system/record-books.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable record-books     # start automatically on every boot
+#   sudo systemctl start record-books      # start it now
+#   systemctl status record-books          # confirm "active (running)"
+#
+# MONITOR:
+#   journalctl -u record-books -f          # live log (replaces tail -f recorder.log)
+#   wc -l ~/WeatherEdge/data/book_recordings/books_*.jsonl
+
+[Unit]
+Description=WeatherEdge Live Order-Book Recorder
+After=network-online.target
+Wants=network-online.target
+# Never stop trying to restart — a recorder should always be running.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/WeatherEdge
+ExecStart=/root/WeatherEdge/.venv/bin/python -u -m scripts.record_books --top 12 --min-interval 5 --sample-interval 60 --depth-levels 20
+
+# Restart on ANY exit (crash, clean exit, OOM kill); WantedBy handles reboot.
+Restart=always
+RestartSec=15
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=record-books
+
+# Optional API keys / config; the leading '-' means "don't fail if absent".
+EnvironmentFile=-/root/WeatherEdge/.env
+
+[Install]
+WantedBy=multi-user.target
