@@ -93,6 +93,44 @@ def simulate_passive_maker(
     }
 
 
+def simulate_skewed_maker(
+    path: list[tuple[int, float]],
+    band: float,
+    size_usd: float,
+    resolution_value: float,
+    model_call: int,
+) -> dict[str, float]:
+    """
+    One-sided (model-gated) maker held to resolution.
+
+    ``model_call`` = 1 → predict YES → post the BID only (willing to buy YES).
+    ``model_call`` = 0 → predict NO  → post the ASK only (willing to sell YES).
+
+    This is passive directional trading: you only rest the side your model
+    favours and hold any fill to resolution. ``resolution_pnl`` is the P&L that
+    matters here (you hold, you don't flatten).
+    """
+    fills = 0
+    shares = 0.0
+    resolution_pnl = 0.0
+    for (_, m0), (_, m1) in zip(path, path[1:]):
+        if model_call == 1:
+            bid = m0 - band
+            if m1 <= bid and bid > 0:           # bought YES at bid
+                sh = size_usd / bid
+                fills += 1
+                shares += sh
+                resolution_pnl += (resolution_value - bid) * sh
+        else:
+            ask = m0 + band
+            if m1 >= ask and ask < 1:           # sold YES at ask
+                sh = size_usd / ask
+                fills += 1
+                shares += sh
+                resolution_pnl += (ask - resolution_value) * sh
+    return {"fills": fills, "shares": shares, "resolution_pnl": resolution_pnl}
+
+
 # ---------------------------------------------------------------------------
 # pmxt loader  (defensive about the inner JSON schema)
 # ---------------------------------------------------------------------------
